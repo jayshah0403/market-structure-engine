@@ -69,7 +69,6 @@ poc = 0
 
 levels = sorted(counts.keys())
 range_mid = (levels[-1] + levels[0])/2
-
 for price,tpo in counts.items():
     if tpo > max_tpo:
         max_tpo = tpo
@@ -92,18 +91,39 @@ while captured < target:
         lower_i -= 1
     else:
         break
+arr_ib = []
+arr_single_tpo = []
+for price,periods in profile.items():
+    if len(periods) == 1:
+        arr_single_tpo.append(price)
+    if (1 in periods or 0 in periods):
+        arr_ib.append(price)
 
+ib_low = min(arr_ib)
+ib_high = max(arr_ib)
 
+is_poor_high = counts[levels[-1]] >= 2
+is_poor_low = counts[levels[0]] >= 2
 
 for price in sorted(profile,reverse=True):
     row = ""
     for p in sorted(profile[price]):
         row+= letters[int(p)]
+    print(f'{price} {row}',end='')
     if price == poc:
-        print(f'{price} {row} ---> POC')
-    elif price == levels[higher_i-1]:
-        print(f'{price} {row} ---> VAH')
-    elif price == levels[lower_i+1]:
-        print(f'{price} {row} ---> VAL')
-    else:
-        print(f'{price} {row}')
+        print(f'   ---> POC',end='')
+    if price == levels[higher_i-1]:
+        print(f'   ---> VAH',end='')
+    if price == levels[lower_i+1]:
+        print(f'   ---> VAL',end='')
+    if price == ib_low:
+        print(f'   ---> IBL',end='')
+    if price == ib_high:
+        print(f'   ---> IBH',end='')
+    if price in arr_single_tpo:
+        print(f'   ---> Single TPO',end='')
+    print()
+if (is_poor_high):
+    print(f'POOR HIGH: {levels[-1]} ',end='')
+if (is_poor_low):
+    print(f'POOR LOW: {levels[0]}',end='')
