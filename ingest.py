@@ -1,32 +1,39 @@
 from psycopg2 import extras
-from psycopg2 import extras
-from psycopg2 import extras
-from psycopg2 import extras
-from psycopg2 import extras
-from psycopg2 import extras
-from psycopg2 import extras
-from json import decoder
-from collections import abc
-from collections import abc
-from requests import sessions
-import subprocess
-import subprocess
 import requests
 import psycopg2
 import os
+# pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 from psycopg2.extras import execute_values
 from collections import defaultdict
 import string
+from datetime import datetime,timezone
 
 
 load_dotenv()                                  # reads .env into environment
 conn_string = os.environ["CONNECTION_STRING"]  # pulls your variable out
 conn = psycopg2.connect(conn_string)
 cur = conn.cursor()
+letters = string.ascii_uppercase + string.ascii_lowercase
 
 start_timestamp = 1783382400000
 end_timestamp = start_timestamp+86400000
+
+def get_profile_grid(start_ts_ms):
+    end_ts_ms = start_ts_ms + 86400000
+    cur.execute("""
+        SELECT FLOOR(price / 25) * 25 AS price_bucket,
+               FLOOR(EXTRACT(EPOCH FROM (ts AT TIME ZONE 'UTC')::time) / 1800) AS period,
+               COUNT(*) AS trade_count,
+               SUM(quantity) AS volume
+        FROM trades
+        WHERE ts >= to_timestamp(%s / 1000.0) AND ts < to_timestamp(%s / 1000.0)
+        GROUP BY price_bucket, period
+        ORDER BY price_bucket, period;
+    """, (start_ts_ms, end_ts_ms))
+    rows = cur.fetchall()
+    return rows
+
 def fetchDayRecords(date):
     cur.execute("SELECT id FROM instruments WHERE symbol = %s", ("BTCUSDT",))
     instrument_id = cur.fetchone()[0]
@@ -53,94 +60,117 @@ def fetchDayRecords(date):
         if len(response) < 1000:
             break
 
-def get_profile_grid(start_ts_ms):
-    end_ts_ms = start_ts_ms + 86400000
-    cur.execute("""
-        SELECT FLOOR(price / 25) * 25 AS price_bucket,
-               FLOOR(EXTRACT(EPOCH FROM (ts AT TIME ZONE 'UTC')::time) / 1800) AS period,
-               COUNT(*) AS trade_count,
-               SUM(quantity) AS volume
-        FROM trades
-        WHERE ts >= to_timestamp(%s / 1000.0) AND ts < to_timestamp(%s / 1000.0)
-        GROUP BY price_bucket, period
-        ORDER BY price_bucket, period;
-    """, (start_ts_ms, end_ts_ms))
-    rows = cur.fetchall()
-    return rows
+def compute_profile(start_timestamp):
+    lst = get_profile_grid(start_timestamp)
+    profile = defaultdict(list)
+    for price_bucket, period, trade_count, volume in lst:
+        profile[price_bucket].append(period)
+    return profile
 
-lst = get_profile_grid(start_timestamp)
-profile = defaultdict(list)
-for price_bucket, period, trade_count, volume in lst:
-    profile[price_bucket].append(period)
-letters = string.ascii_uppercase + string.ascii_lowercase
+def compute_poc():
+    poc = 0
+    max_tpo = 0
+    range_mid = (levels[-1] + levels[0])/2
+    for price,tpo in counts.items():
+        if tpo > max_tpo:
+            max_tpo = tpo
+            poc = price
+        elif tpo == max_tpo and abs(price - range_mid) < abs(poc - range_mid):
+            max_tpo = tpo
+            poc = price
+    return poc
 
-counts = {price: len(periods) for price,periods in profile.items()}
-max_tpo = 0
-poc = 0
+def compute_ib(profile):
+    arr_ib = []
+    arr_single_tpo = []
+    for price,periods in profile.items():
+        if len(periods) == 1:
+            arr_single_tpo.append(price)
+        if (1 in periods or 0 in periods):
+            arr_ib.append(price)
+    return max(arr_ib),min(arr_ib),arr_single_tpo 
+def compute_structures(start_timestamp):
+    
+    poc = compute_poc()
+    
+                     
+    ib_high, ib_low,arr_single_tpo = compute_ib(profile)    
+    is_dd = detect_double_distribution_split(segment_profile(1))
+    up_conf, down_conf = detect_trend(start_timestamp)
+    day_type, reason = classify_day_type(start_timestamp, ib_high, ib_low,
+                                          max(levels), min(levels), is_dd, up_conf, down_conf)
+    extension_above,extension_below = (max(levels)-ib_high)/(ib_high-ib_low),(ib_low-min(levels))/(ib_high-ib_low)
+    vah,val = compute_value_area(poc)
+    return {
+        "date":datetime.fromtimestamp(start_timestamp/1000, timezone.utc).strftime("%Y-%m-%d"),
+        "day_type": day_type,
+        "reason": reason,
+        "poc": float(poc), "vah": float(vah), "val": float(val),
+        "ib_high": float(ib_high), "ib_low": float(ib_low),
+        "arr_single_tpo": arr_single_tpo,
+        "poor_high": counts[max(levels)] >= 2,
+        "poor_low": counts[min(levels)] >= 2,
+        "extension_above": extension_above,
+        "extension_below": extension_below
+    }
 
-levels = sorted(counts.keys())
-range_mid = (levels[-1] + levels[0])/2
-for price,tpo in counts.items():
-    if tpo > max_tpo:
-        max_tpo = tpo
-        poc = price
-    elif tpo == max_tpo and abs(price - range_mid) < abs(poc - range_mid):
-        max_tpo = tpo
-        poc = price
-
-i_poc = levels.index(poc)
-captured = counts[poc]
-target = sum(counts.values()) * 0.7
-higher_i = i_poc + 1
-lower_i = i_poc - 1
-while captured < target:
-    if higher_i < len(levels) and (not lower_i >= 0 or counts[levels[higher_i]] >= counts[levels[lower_i]]):
-        captured += counts[levels[higher_i]]
-        higher_i += 1
-    elif lower_i >= 0:
-        captured += counts[levels[lower_i]]
-        lower_i -= 1
-    else:
-        break
-arr_ib = []
-arr_single_tpo = []
-for price,periods in profile.items():
-    if len(periods) == 1:
-        arr_single_tpo.append(price)
-    if (1 in periods or 0 in periods):
-        arr_ib.append(price)
-
-ib_low = min(arr_ib)
-ib_high = max(arr_ib)
-
-is_poor_high = counts[levels[-1]] >= 2
-is_poor_low = counts[levels[0]] >= 2
-
-# for price in sorted(profile,reverse=True):
-#     row = ""
-#     for p in sorted(profile[price]):
-#         row+= letters[int(p)]
-#     print(f'{price} {row}',end='')
-#     if price == poc:
-#         print(f'   ---> POC',end='')
-#     if price == levels[higher_i-1]:
-#         print(f'   ---> VAH',end='')
-#     if price == levels[lower_i+1]:
-#         print(f'   ---> VAL',end='')
-#     if price == ib_low:
-#         print(f'   ---> IBL',end='')
-#     if price == ib_high:
-#         print(f'   ---> IBH',end='')
-#     if price in arr_single_tpo:
-#         print(f'   ---> Single TPO',end='')
-#     print()
-# if (is_poor_high):
-#     print(f'POOR HIGH: {levels[-1]} ',end='')
-# if (is_poor_low):
-#     print(f'POOR LOW: {levels[0]}',end='')
+profile = compute_profile(start_timestamp)
+levels = sorted(profile.keys())
+counts = {level: len(periods) for level, periods in profile.items()}
 
 
-def segment_profile(levels,counts,thin_max = 1):
+def compute_value_area(poc):
+    i_poc = levels.index(poc)
+    captured = counts[poc]
+    target = sum(counts.values()) * 0.7
+    higher_i = i_poc + 1
+    lower_i = i_poc - 1
+    while captured < target:
+        if higher_i < len(levels) and (not lower_i >= 0 or counts[levels[higher_i]] >= counts[levels[lower_i]]):
+            captured += counts[levels[higher_i]]
+            higher_i += 1
+        elif lower_i >= 0:
+            captured += counts[levels[lower_i]]
+            lower_i -= 1
+        else:
+            break
+    return levels[higher_i-1],levels[lower_i+1]
+
+def print_market_profile(start_timestamp):
+    profile = compute_profile(start_timestamp)
+    levels = sorted(profile.keys())
+    
+    counts = {level: len(periods) for level, periods in profile.items()}
+    poc = compute_poc(levels)
+    ib_high,ib_low,arr_single_tpo = compute_ib(profile)
+    is_poor_high = counts[levels[-1]] >= 2
+    is_poor_low = counts[levels[0]] >= 2
+    vah,val = compute_value_area(levels,counts)
+    for price in sorted(profile,reverse=True):
+        row = ""
+        for p in sorted(profile[price]):
+            row+= letters[int(p)]
+        print(f'{price} {row}',end='')
+        if price == poc:
+            print(f'   ---> POC',end='')
+        if price == vah:
+            print(f'   ---> VAH',end='')
+        if price == val:
+            print(f'   ---> VAL',end='')
+        if price == ib_low:
+            print(f'   ---> IBL',end='')
+        if price == ib_high:
+            print(f'   ---> IBH',end='')
+        if price in arr_single_tpo:
+            print(f'   ---> Single TPO',end='')
+        print()
+        if (is_poor_high):
+            print(f'POOR HIGH: {levels[-1]} ',end='')
+        if (is_poor_low):
+            print(f'POOR LOW: {levels[0]}',end='')
+
+
+def segment_profile(thin_max = 1):
     segmented_profile = []
     thick_run = []
     thin_run = []
@@ -163,7 +193,6 @@ def segment_profile(levels,counts,thin_max = 1):
         
 def detect_double_distribution_split(segments, min_thick_levels=3):
     segmented_profile = segments
-    flag = False
     for i in range(len(segmented_profile) - 2):
         a, b, c = segments[i], segments[i+1], segments[i+2]
         if a[0] == 'thick' and len(a[1]) >= min_thick_levels \
@@ -242,16 +271,30 @@ def classify_day_type(start_timestamp, ib_high, ib_low, day_high, day_low,
             f"{max(uptrend_conf, downtrend_conf):.2f} — directional but not a clean trend")
     else:
         return ("Normal", "Balanced day, price worked within the initial balance")
-uptrend_confirmation,downtrend_confirmation = detect_trend(start_timestamp)
-print(classify_day_type(start_timestamp, ib_high, ib_low, max(levels), min(levels),
-                      detect_double_distribution_split(segment_profile(levels, counts, 1)), uptrend_confirmation, downtrend_confirmation))
+
+def generate_report(structures):
+    lines = []
+    lines.append("═" * 40)
+    lines.append(f"BTC/USDT — Session Report, {structures['date']}")
+    lines.append("═" * 40)
+    lines.append(f"Day Type   : {structures['day_type']}")
+    lines.append(f"Reason     : {structures['reason']}")
+    lines.append(f"VALUE")
+    lines.append(f"POC         : {structures['poc']}")
+    lines.append(f"Value Area  : {structures['val']} - {structures['vah']}")
+    lines.append(f"Initial Balance: {structures['ib_low']} - {structures['ib_high']}")
+    lines.append(f"STRUCTURE")
+    lines.append(f"Extension: {structures['extension_above']:.2f}/{structures['extension_below']:.2f}")
+    lines.append(f"Buying Tail: {min(structures['arr_single_tpo']) if min(structures['arr_single_tpo']) == min(levels) else 'None'} ")
+    lines.append(f"Selling Tail: {max(structures['arr_single_tpo']) if max(structures['arr_single_tpo']) == max(levels) else 'None'} ")
+    lines.append(f"Poor Low/High: {min(levels) if counts[min(levels)] > 1 else 'None'} / {max(levels) if counts[max(levels)] > 1 else 'None'}") 
+    lines.append("=" * 40)
+
+    return "\n".join(lines) 
 
 
-
-
-                    
-        
-            
     
 
+report = generate_report(compute_structures(start_timestamp))
+print(report)            
     
