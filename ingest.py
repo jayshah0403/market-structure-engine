@@ -295,6 +295,7 @@ def generate_report(structures):
 
     
 
-report = generate_report(compute_structures(start_timestamp))
-print(report)            
+if __name__ == "__main__":
+    report = generate_report(compute_structures(start_timestamp))
+    print(report)         
     
