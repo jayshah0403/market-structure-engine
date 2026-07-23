@@ -98,4 +98,4 @@ Covers distribution-split detection against synthetic profiles (including the ta
 - The schema is instrument-agnostic, with per-instrument session boundaries and tick size held as configuration, so additional markets are a row rather than a code change.
 - Structure computation is separated from rendering: a single `compute_structures()` call produces the dictionary that serves both the JSON response and the written report.
 
-**Live:** https://your-url/docs
+**Live:** https://market-structure-engine-production.up.railway.app/doc
