@@ -111,9 +111,7 @@ Session = UTC 00:00–24:00. Bucket = $25. Period = 30 min (48 periods, lettered
 ## 7. Known bugs / debts (the list the v2 spec should address or consciously defer)
 
 **Correctness — verify before anything else**
-- **Suspected swap:** `"poor_high": float(min(levels)) if counts[min(levels)] >= 2` and `"poor_low": float(max(levels)) if counts[max(levels)] >= 2`. A poor high is the day's *high* with ≥ 2 TPOs; the code derives `poor_high` from `min(levels)`. Confirm and fix; this was caught once before and appears to have regressed.
-- `buying_tail`/`selling_tail` call `min(arr_single_tpo)`/`max(arr_single_tpo)` unguarded — a day with zero single-print buckets raises `ValueError("min() arg is an empty sequence")`, which the API mislabels as a 404 "no data".
-- Backfill loop lacks `conn.rollback()` in the `except` (cascade failure).
+- Backfill loop lacks `conn.rollback()` in the `except` (cascade failure). **Deferred, not fixed:** the loop and `load_day_from_archive` are not in the repo (§3b), so PR 1 had nothing to patch. The requirement moved to PR 7 (Scheduled warm-up), which is where backfill is re-implemented.
 
 **Architecture**
 - Raw ticks retained forever; engine only ever reads aggregates. Root cause of the outage. Decided direction: compute per-day levels on ingest → persist `daily_levels` → discard ticks.
@@ -129,7 +127,7 @@ Session = UTC 00:00–24:00. Bucket = $25. Period = 30 min (48 periods, lettered
 **Ops**
 - Supabase project must be recreated from scratch (schema + tables). Railway service must be redeployed with the new `CONNECTION_STRING`. README URL/status may be stale.
 - No scheduled ingestion — data only exists for days manually loaded.
-- No CI, no linting, no dependency pinning.
+- No linting, no dependency pinning. (CI added in PR 1: GitHub Actions runs `python -m pytest` on push and pull request.)
 
 ---
 

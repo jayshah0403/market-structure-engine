@@ -114,6 +114,17 @@ def compute_structures(start_timestamp):
                                           max(levels), min(levels), is_dd, up_conf, down_conf)
     extension_above, extension_below = (max(levels) - ib_high) / (ib_high - ib_low), (ib_low - min(levels)) / (ib_high - ib_low)
     vah, val = compute_value_area(poc, levels, counts)
+    day_high, day_low = max(levels), min(levels)
+    # A poor extreme is the day's own extreme revisited in >= 2 periods.
+    poor_high = float(day_high) if counts[day_high] >= 2 else None
+    poor_low = float(day_low) if counts[day_low] >= 2 else None
+    # A tail is a single-print run running all the way to a day extreme. With no
+    # single prints at all there is no tail, and min()/max() must not be called.
+    if arr_single_tpo:
+        buying_tail = float(min(arr_single_tpo)) if min(arr_single_tpo) == day_low else None
+        selling_tail = float(max(arr_single_tpo)) if max(arr_single_tpo) == day_high else None
+    else:
+        buying_tail = selling_tail = None
     return {
         "date": datetime.fromtimestamp(start_timestamp / 1000, timezone.utc).strftime("%Y-%m-%d"),
         "day_type": day_type,
@@ -121,14 +132,14 @@ def compute_structures(start_timestamp):
         "poc": float(poc), "vah": float(vah), "val": float(val),
         "ib_high": float(ib_high), "ib_low": float(ib_low),
         "arr_single_tpo": arr_single_tpo,
-        "poor_high": float(min(levels)) if counts[min(levels)] >= 2 else None,
-        "poor_low": float(max(levels)) if counts[max(levels)] >= 2 else None,
+        "poor_high": poor_high,
+        "poor_low": poor_low,
         "extension_above": extension_above,
         "extension_below": extension_below,
-        "buying_tail": float(min(arr_single_tpo)) if min(arr_single_tpo) == min(levels) else None,
-        "selling_tail": float(max(arr_single_tpo)) if max(arr_single_tpo) == max(levels) else None,
-        "day_low": float(min(levels)),
-        "day_high": float(max(levels))
+        "buying_tail": buying_tail,
+        "selling_tail": selling_tail,
+        "day_low": float(day_low),
+        "day_high": float(day_high)
     }
 
 def compute_value_area(poc, levels, counts):
