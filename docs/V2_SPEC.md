@@ -98,13 +98,13 @@ Seed: BTCUSDT only. **[DECIDE]** any second instrument at launch (ETHUSDT?) — 
 **Rules.**
 - `poor_high = day_high if tpo_count(day_high) >= 2 else None`; `poor_low = day_low if tpo_count(day_low) >= 2 else None`.
 - Tails: if no single-print buckets exist, `buying_tail = selling_tail = None`; never call `min()`/`max()` on a possibly-empty list.
-- Backfill loop: `except` block calls `conn.rollback()` when `conn` is not None.
 - Add GitHub Actions workflow running `pytest` on push/PR.
+
+*(The backfill-rollback fix formerly specified here moved to PR 7: the v1 backfill loop is not in the repo — see CURRENT_STATE §3b — and PR 7 is where backfill is re-implemented.)*
 
 **Acceptance.**
 - Unit test: synthetic profile with ≥2 TPOs at the high and 1 at the low → `poor_high == day_high`, `poor_low is None`.
 - Unit test: profile with zero single-print buckets → tails are `None`, no exception.
-- Unit test: loop helper continues to the next date after an injected exception (mock connection asserts `rollback()` called).
 - CI green.
 
 ---
@@ -270,10 +270,12 @@ C1 is excluded (ends before `from`); C2 is returned whole although it starts bef
 - Mechanism **[DECIDE]** — default: Railway cron service hitting an internal `POST /v1/admin/compute?date=yesterday` protected by a token; alternative: in-process APScheduler.
 - Runs daily at **[DECIDE]** default 03:00 UTC; computes T−1 for every active instrument; retries once after 1 h on `SessionNotPublished`.
 - Window **[DECIDE]** default 30 days; on first deploy, backfills the window (sequentially, respecting the concurrency limit).
+- Backfill iterates days sequentially; on any failure it rolls back the DB transaction, logs the date, and continues to the next day. One failed day must never poison subsequent days.
 
 **Acceptance.**
 - Job is idempotent (re-running for a computed date is a no-op).
 - Backfill test on a 5-day fixture window.
+- Injected failure on day 2 of a 5-day fixture → day 2 logged, days 3–5 still computed, `rollback()` called exactly once.
 
 ---
 
