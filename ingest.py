@@ -6,19 +6,28 @@ from dotenv import load_dotenv
 from psycopg2.extras import execute_values
 from collections import defaultdict
 import string
-from datetime import datetime,timezone
+from datetime import datetime, timezone
 
 
-load_dotenv()                                  # reads .env into environment
-conn_string = os.environ["CONNECTION_STRING"]  # pulls your variable out
-conn = psycopg2.connect(conn_string)
-cur = conn.cursor()
+conn = None
+cur = None
+
+load_dotenv()
+
+def get_cursor():
+    global conn, cur
+    if cur is None:
+        conn = psycopg2.connect(os.environ["CONNECTION_STRING"])
+        cur = conn.cursor()
+    return cur
+
 letters = string.ascii_uppercase + string.ascii_lowercase
 
 start_timestamp = 1783382400000
-end_timestamp = start_timestamp+86400000
+end_timestamp = start_timestamp + 86400000
 
 def get_profile_grid(start_ts_ms):
+    cur = get_cursor()
     end_ts_ms = start_ts_ms + 86400000
     cur.execute("""
         SELECT FLOOR(price / 25) * 25 AS price_bucket,
@@ -34,25 +43,26 @@ def get_profile_grid(start_ts_ms):
     return rows
 
 def fetchDayRecords(date):
+    cur = get_cursor()
     cur.execute("SELECT id FROM instruments WHERE symbol = %s", ("BTCUSDT",))
     instrument_id = cur.fetchone()[0]
     start_timestamp = date
     end_time = date + 86400000
-    first_trade = requests.get("https://api.binance.com/api/v3/aggTrades",params={"symbol":"BTCUSDT","startTime":start_timestamp,"limit": 1}).json()
+    first_trade = requests.get("https://api.binance.com/api/v3/aggTrades", params={"symbol": "BTCUSDT", "startTime": start_timestamp, "limit": 1}).json()
     from_id = first_trade[0]['a']
     while True:
-        response = requests.get("https://api.binance.com/api/v3/aggTrades", params={"symbol":"BTCUSDT","fromId":from_id,"limit":1000}).json()
+        response = requests.get("https://api.binance.com/api/v3/aggTrades", params={"symbol": "BTCUSDT", "fromId": from_id, "limit": 1000}).json()
         if len(response) == 0:
             break
         batch = [t for t in response if t['T'] <= end_time]
         if batch:
-            rows = [(t['a'],instrument_id,t['p'],t['q'],t['T'],t['m']) for t in batch]
-            execute_values(cur,"INSERT INTO trades (agg_trade_id, instrument_id, price, quantity, ts, is_buyer_maker) "
+            rows = [(t['a'], instrument_id, t['p'], t['q'], t['T'], t['m']) for t in batch]
+            execute_values(cur, "INSERT INTO trades (agg_trade_id, instrument_id, price, quantity, ts, is_buyer_maker) "
                 "VALUES %s ON CONFLICT (agg_trade_id) DO NOTHING",
                 rows,
-                template = "(%s, %s, %s, %s   , to_timestamp(%s / 1000.0), %s)")
+                template="(%s, %s, %s, %s, to_timestamp(%s / 1000.0), %s)")
             conn.commit()
-        
+
         if response[-1]['T'] > end_time:
             break
         from_id = response[-1]['a'] + 1
@@ -66,11 +76,11 @@ def compute_profile(start_timestamp):
         profile[price_bucket].append(period)
     return profile
 
-def compute_poc(levels,counts):
+def compute_poc(levels, counts):
     poc = 0
     max_tpo = 0
-    range_mid = (levels[-1] + levels[0])/2
-    for price,tpo in counts.items():
+    range_mid = (levels[-1] + levels[0]) / 2
+    for price, tpo in counts.items():
         if tpo > max_tpo:
             max_tpo = tpo
             poc = price
@@ -82,12 +92,12 @@ def compute_poc(levels,counts):
 def compute_ib(profile):
     arr_ib = []
     arr_single_tpo = []
-    for price,periods in profile.items():
+    for price, periods in profile.items():
         if len(periods) == 1:
             arr_single_tpo.append(price)
         if (1 in periods or 0 in periods):
             arr_ib.append(price)
-    return max(arr_ib),min(arr_ib),arr_single_tpo 
+    return max(arr_ib), min(arr_ib), arr_single_tpo
 
 def compute_structures(start_timestamp):
     profile = compute_profile(start_timestamp)
@@ -95,18 +105,17 @@ def compute_structures(start_timestamp):
     if not levels:
         raise ValueError(f"No trade data for {start_timestamp}")
     counts = {level: len(periods) for level, periods in profile.items()}
-    poc = compute_poc(levels,counts)
-    
-                     
-    ib_high, ib_low,arr_single_tpo = compute_ib(profile)    
-    is_dd = detect_double_distribution_split(segment_profile(levels,counts,1))
+    poc = compute_poc(levels, counts)
+
+    ib_high, ib_low, arr_single_tpo = compute_ib(profile)
+    is_dd = detect_double_distribution_split(segment_profile(levels, counts, 1))
     up_conf, down_conf = detect_trend(start_timestamp)
     day_type, reason = classify_day_type(start_timestamp, ib_high, ib_low,
                                           max(levels), min(levels), is_dd, up_conf, down_conf)
-    extension_above,extension_below = (max(levels)-ib_high)/(ib_high-ib_low),(ib_low-min(levels))/(ib_high-ib_low)
-    vah,val = compute_value_area(poc,levels,counts)
+    extension_above, extension_below = (max(levels) - ib_high) / (ib_high - ib_low), (ib_low - min(levels)) / (ib_high - ib_low)
+    vah, val = compute_value_area(poc, levels, counts)
     return {
-        "date":datetime.fromtimestamp(start_timestamp/1000, timezone.utc).strftime("%Y-%m-%d"),
+        "date": datetime.fromtimestamp(start_timestamp / 1000, timezone.utc).strftime("%Y-%m-%d"),
         "day_type": day_type,
         "reason": reason,
         "poc": float(poc), "vah": float(vah), "val": float(val),
@@ -118,11 +127,11 @@ def compute_structures(start_timestamp):
         "extension_below": extension_below,
         "buying_tail": float(min(arr_single_tpo)) if min(arr_single_tpo) == min(levels) else None,
         "selling_tail": float(max(arr_single_tpo)) if max(arr_single_tpo) == max(levels) else None,
-        "day_low": float(min(levels)), 
+        "day_low": float(min(levels)),
         "day_high": float(max(levels))
     }
 
-def compute_value_area(poc,levels,counts):
+def compute_value_area(poc, levels, counts):
     i_poc = levels.index(poc)
     captured = counts[poc]
     target = sum(counts.values()) * 0.7
@@ -137,67 +146,33 @@ def compute_value_area(poc,levels,counts):
             lower_i -= 1
         else:
             break
-    return levels[higher_i-1],levels[lower_i+1]
+    return levels[higher_i - 1], levels[lower_i + 1]
 
-# def print_market_profile(start_timestamp):
-#     profile = compute_profile(start_timestamp)
-#     levels = sorted(profile.keys())
-    
-#     counts = {level: len(periods) for level, periods in profile.items()}
-#     poc = compute_poc(levels,counts)
-#     ib_high,ib_low,arr_single_tpo = compute_ib(profile)
-#     is_poor_high = counts[levels[-1]] >= 2
-#     is_poor_low = counts[levels[0]] >= 2
-#     vah,val = compute_value_area(levels,counts)
-#     for price in sorted(profile,reverse=True):
-#         row = ""
-#         for p in sorted(profile[price]):
-#             row+= letters[int(p)]
-#         print(f'{price} {row}',end='')
-#         if price == poc:
-#             print(f'   ---> POC',end='')
-#         if price == vah:
-#             print(f'   ---> VAH',end='')
-#         if price == val:
-#             print(f'   ---> VAL',end='')
-#         if price == ib_low:
-#             print(f'   ---> IBL',end='')
-#         if price == ib_high:
-#             print(f'   ---> IBH',end='')
-#         if price in arr_single_tpo:
-#             print(f'   ---> Single TPO',end='')
-#         print()
-#         if (is_poor_high):
-#             print(f'POOR HIGH: {levels[-1]} ',end='')
-#         if (is_poor_low):
-#             print(f'POOR LOW: {levels[0]}',end='')
-
-
-def segment_profile(levels,counts,thin_max = 1,):
+def segment_profile(levels, counts, thin_max=1):
     segmented_profile = []
     thick_run = []
     thin_run = []
-    for price in sorted(levels,reverse=True):
+    for price in sorted(levels, reverse=True):
         if counts[price] >= 2:
             if len(thin_run) != 0:
-                segmented_profile.append(["thin",thin_run])
+                segmented_profile.append(["thin", thin_run])
             thin_run = []
             thick_run.append(int(price))
         elif counts[price] <= thin_max:
             if len(thick_run) != 0:
-                segmented_profile.append(["thick",thick_run])
+                segmented_profile.append(["thick", thick_run])
             thick_run = []
             thin_run.append(int(price))
     if len(thin_run) != 0:
-        segmented_profile.append(["thin",thin_run])
+        segmented_profile.append(["thin", thin_run])
     if len(thick_run) != 0:
-        segmented_profile.append(["thick",thick_run])
+        segmented_profile.append(["thick", thick_run])
     return segmented_profile
-        
+
 def detect_double_distribution_split(segments, min_thick_levels=3):
     segmented_profile = segments
     for i in range(len(segmented_profile) - 2):
-        a, b, c = segments[i], segments[i+1], segments[i+2]
+        a, b, c = segments[i], segments[i + 1], segments[i + 2]
         if a[0] == 'thick' and len(a[1]) >= min_thick_levels \
             and b[0] == 'thin' \
             and c[0] == 'thick' and len(c[1]) >= min_thick_levels:
@@ -205,6 +180,7 @@ def detect_double_distribution_split(segments, min_thick_levels=3):
     return False
 
 def detect_trend(start_timestamp):
+    cur = get_cursor()
     cur.execute('''SELECT
     FLOOR(EXTRACT(EPOCH FROM (ts AT TIME ZONE 'UTC')::time) / 1800) AS period,
     MAX(price) AS period_high,
@@ -212,21 +188,19 @@ def detect_trend(start_timestamp):
     FROM trades
     WHERE ts >= to_timestamp(%s / 1000.0) AND ts < to_timestamp(%s / 1000.0)
     GROUP BY period
-    ORDER BY period''',(start_timestamp,start_timestamp+86400000))
+    ORDER BY period''', (start_timestamp, start_timestamp + 86400000))
     periods = cur.fetchall()
     if len(periods) < 2:
         raise ValueError(f"Insufficient period data for {start_timestamp}")
     uptrend_violation = 0
     downtrend_violation = 0
-    for i in range(1,len(periods)):
-        if periods[i-1][2] > periods[i][2]:
+    for i in range(1, len(periods)):
+        if periods[i - 1][2] > periods[i][2]:
             uptrend_violation += 1
-        if periods[i-1][1] < periods[i][1]:
+        if periods[i - 1][1] < periods[i][1]:
             downtrend_violation += 1
 
-    return (1-(uptrend_violation/(len(periods)-1)),1-(downtrend_violation/(len(periods)-1)))
-
-# detect_trend(start_timestamp)
+    return (1 - (uptrend_violation / (len(periods) - 1)), 1 - (downtrend_violation / (len(periods) - 1)))
 
 def classify_day_type(start_timestamp, ib_high, ib_low, day_high, day_low,
                       is_double_dist, uptrend_conf, downtrend_conf):
@@ -273,15 +247,12 @@ def generate_report(structures):
     lines.append(f"Extension: {structures['extension_above']:.2f}/{structures['extension_below']:.2f}")
     lines.append(f"Buying Tail: {structures['buying_tail'] or 'None'} ")
     lines.append(f"Selling Tail: {structures['selling_tail'] or 'None'}")
-    lines.append(f"Poor Low/High: {structures['poor_low'] or 'None'} / {structures['poor_high'] or 'None'}") 
+    lines.append(f"Poor Low/High: {structures['poor_low'] or 'None'} / {structures['poor_high'] or 'None'}")
     lines.append("=" * 40)
 
-    return "\n".join(lines) 
+    return "\n".join(lines)
 
-
-    
 
 if __name__ == "__main__":
     report = generate_report(compute_structures(start_timestamp))
-    print(report)         
-    
+    print(report)
