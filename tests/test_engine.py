@@ -1,8 +1,5 @@
-import os
-
 from ingest import segment_profile, detect_double_distribution_split, classify_day_type, compute_structures
 import ingest
-import pytest
 
 def test_tail_is_not_double_distribution():
     counts = {100: 8, 99: 9, 98: 10, 97: 8, 96: 1, 95: 1, 94: 1, 93: 1,
@@ -19,15 +16,6 @@ def test_genuine_double_distribution():
 def test_classifies_directional_when_one_sided_no_trend():
     label, reason = classify_day_type(0, 64300, 63975, 64300, 62650, False, 0.43, 0.60)
     assert label == "Directional (unclassified)"
-
-@pytest.mark.skipif(
-    "CONNECTION_STRING" not in os.environ,
-    reason="integration test: needs a live database",
-)
-def test_raises_on_missing_data():
-    with pytest.raises(ValueError):
-        compute_structures(9999999999999)
-
 
 # --- PR 1 acceptance tests -------------------------------------------------
 #

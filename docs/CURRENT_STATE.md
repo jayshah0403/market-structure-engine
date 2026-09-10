@@ -1,4 +1,4 @@
-# Market Structure Engine — Current State (v1 inventory, Sept 2026)
+# Market Structure Engine — Current State (Sept 2026; v1 inventory + PRs 1–2)
 
 Baseline document. Everything the system does today, how it does it, and the debts to spec against. No proposals in here — the v2 spec is a separate doc.
 
@@ -8,53 +8,44 @@ Baseline document. Everything the system does today, how it does it, and the deb
 
 | File / thing | Role | Status |
 |---|---|---|
-| `ingest.py` | Everything: DB connection, ingestion (2 paths), profile computation, all detectors, classifier, report generator | Working; ~300 lines, single module |
-| `api.py` | FastAPI wrapper — 2 endpoints + auto `/docs` | Working code; serves nothing (DB dead) |
-| `tests/test_engine.py` + `conftest.py` | 3 pure unit tests + 1 DB integration test | Pure tests pass without DB (lazy connection) |
+| `ingest.py` | Profile computation, all detectors, classifier, report generator. No DB connection code and no ingestion since PR 2 | ~240 lines; `get_profile_grid` and `detect_trend` still query the dropped `trades` table — replaced in PR 3 |
+| `db.py` | The only module holding SQL against the v2 tables: lazy `get_connection`/`get_cursor`, `get_instrument`, `get_daily_levels`, `upsert_daily_levels`, `list_daily_levels` | Added in PR 2; storage only, computes nothing |
+| `db/schema.sql` | v2 DDL (§2) + BTCUSDT seed; drops the v1 tick tables at the top | Added in PR 2 and applied |
+| `scripts/capture_v1_golden.py` | One-shot: ran the v1 SQL path over every ingested day into `tests/fixtures/v1_golden/*.json` before the drop | Ran once; cannot be re-run (its table is gone). PR 3's regression baseline |
+| `api.py` | FastAPI wrapper — 2 endpoints + auto `/docs` | Untouched by PR 2; serves nothing — both routes call `compute_structures`, whose SQL targets the dropped `trades`. Replaced in PR 4 |
+| `tests/test_engine.py`, `tests/test_db.py` | 5 pure engine tests + 2 pure validation tests + 7 DB integration tests. There is no `conftest.py` (this row previously claimed one) | 14 pass with a database; 7 pass / 7 skip without one |
 | `Dockerfile`, `.dockerignore`, `requirements.txt` | `python:3.13-slim`, deps: fastapi, uvicorn, psycopg2-binary, requests, python-dotenv; `.env` excluded from image | Working |
 | Railway | Hosts the container; `CONNECTION_STRING` injected as env var | **Paid plan active (Sept 2026); service was offline after trial expiry — needs redeploy** |
-| Supabase (Postgres, free tier, t4g.nano, ap-southeast-2) | The only data store | **DEAD** — disk full → unrecoverable WAL recovery loop. Must be recreated. |
+| Supabase (Postgres 17.6, free tier, t4g.nano, ap-southeast-2) | The only data store | **LIVE** — the same project, reachable again (owner decision at PR 2: reuse, do not recreate). `db/schema.sql` dropped the tick tables and created the v2 schema: 855 MB → 10 MB, so the disk pressure that killed it is gone. `CONNECTION_STRING` is unchanged. |
 | `README.md` | Pitch + endpoints + setup | Links the Railway URL |
 
 ---
 
-## 2. Data layer (schema as it existed)
+## 2. Data layer (v2 schema, live since PR 2)
 
-**`instruments`** — `id` (PK), `symbol` (e.g. `BTCUSDT`), plus per-instrument config columns (bucket size / tick size) that were added but **never read by the SQL** — the queries hardcode `25`.
+DDL lives in `db/schema.sql` (committed, applied). All access goes through `db.py`.
 
-**`trades`** — `agg_trade_id` (PK, dedup key), `instrument_id` (FK → instruments), `price NUMERIC`, `quantity NUMERIC`, `ts TIMESTAMPTZ`, `is_buyer_maker BOOL`. One row per Binance aggTrade. ~760k–5M rows/day for BTC.
+**`instruments`** — `symbol TEXT PK`, `exchange`, `bucket_size NUMERIC`, `period_seconds INT`, `ib_periods INT`, `archive_url_template TEXT`, `active BOOL`. The v1 surrogate `id` and `tick_size`/`session_start_utc` columns are gone; `symbol` is the key everything else references. Seeded with one row: BTCUSDT / `binance-spot` / 25 / 1800 / 2 / the data.binance.vision daily aggTrades template. These columns exist so the engine can read them — PR 3 is where it starts to (the two surviving SQL queries in `ingest.py` still hardcode 25 and 1800).
 
-**`staging_trades`** — 8 raw columns mirroring the Binance archive CSV exactly (`agg_trade_id, price, quantity, first_id, last_id, ts_micro BIGINT, is_buyer_maker, is_best_match`). No constraints. Truncated after each day's load.
+**`daily_levels`** — one row per session, PK `(symbol, session_date)`; `symbol` is a FK to `instruments`. Carries `engine_version` + `computed_at` (staleness), the classifier output (`day_type`, `reason`), the levels (`poc`, `vah`, `val`, `ib_high`, `ib_low`, `day_high`, `day_low`), the nullable extras (`poor_high`, `poor_low`, `buying_tail`, `selling_tail`), `extension_above`/`extension_below`, `up_conf`/`down_conf`, and two JSONB columns: `single_prints` as contiguous ranges (`[{"from":63000,"to":63075}]`, not v1's flat bucket list) and `profile` as bucket → TPO count, which is what composites merge. `composite_id` is a nullable FK to `composites` (NULL = in no composite).
 
-**Storage model:** raw ticks retained forever. This is what killed the free tier (16 days ≈ tens of millions of rows + PK index + WAL).
+**`composites`** — `id SERIAL PK`, `symbol` FK, `start_date`/`end_date` inclusive, `days` (CHECK ≥ 2), `status` (CHECK in `open`/`closed`), merged `profile` JSONB, `poc`/`vah`/`val`/`high`/`low`, `single_prints` JSONB, nullable `poor_high`/`poor_low`, `engine_version`. Written by PR 6; empty today.
+
+**Storage model:** raw ticks are never persisted. `trades` (7,377,603 rows) and `staging_trades` were dropped when the schema was applied and the database went **855 MB → 10 MB**. Everything the v1 SQL path had computed from those ticks is preserved as JSON in `tests/fixtures/v1_golden/` — 8 days: 2026-07-07, 07-13, 07-14, 07-15, 07-16, 07-27, 07-29, 07-30.
 
 ---
 
-## 3. Ingestion — two paths
+## 3. Ingestion — none in the repo (PR 2 removed the v1 paths)
 
-**3a. `fetchDayRecords(date_ms)` — live REST API path (legacy, slow)**
-- Looks up `instrument_id` for hardcoded `"BTCUSDT"`.
-- Finds the first aggTrade at/after `date_ms` via `startTime`, then pages forward by `fromId` in batches of 1000 until `T > date_ms + 86400000`.
-- Filters each batch to `T <= end_time`, inserts via `execute_values` with `ON CONFLICT (agg_trade_id) DO NOTHING`, commits per batch.
-- Timestamps from the REST API are **milliseconds** → `to_timestamp(%s / 1000.0)`.
-- ~20 min/day. Reconnect/resume works because of `ON CONFLICT`.
+There is currently no code that puts data in. The only write path is `db.upsert_daily_levels(row)`; PR 3 adds the producer that calls it.
 
-**3b. `load_day_from_archive(date_str)` — bulk archive path (current, fast)**
+**3a. `fetchDayRecords(date_ms)` — live REST path.** Deleted in PR 2 (in git history). It was the last user of `requests`, `psycopg2` and `execute_values` inside `ingest.py`, and it wrote to a table that no longer exists. Its millisecond-vs-microsecond divergence from the archive path dies with it.
 
-> **Not in the repo.** Written on the old machine in August and never pushed; the machine is inaccessible. The design is recorded here for the story; PR 2 removes this path regardless.
-- URL: `https://data.binance.vision/data/spot/daily/aggTrades/BTCUSDT/BTCUSDT-aggTrades-{date}.zip`
-- `requests.get` → `io.BytesIO` → `zipfile.ZipFile` → single headerless CSV inside.
-- `cur.copy_expert("COPY staging_trades FROM STDIN WITH (FORMAT csv)", f)` — streams the CSV server-side.
-- `INSERT INTO trades (...) SELECT agg_trade_id, (SELECT id FROM instruments WHERE symbol='BTCUSDT'), price, quantity, to_timestamp(ts_micro / 1000000.0), is_buyer_maker FROM staging_trades ON CONFLICT DO NOTHING;`
-- Archive timestamps are **microseconds** (16 digits) — hence `/ 1000000.0`. (REST path is ms; the two paths use different divisors — a trap.)
-- `TRUNCATE staging_trades;` then `commit`.
-- Requires `SET statement_timeout = '600000'` on the session or Supabase kills the COPY (default timeout too short).
-- ~5 min/day on free tier. Verified exact: July 27 2026 → 762,859 rows = CSV line count.
-- Symbol, URL, and instrument lookup all hardcoded to BTCUSDT.
+**3b. `load_day_from_archive(date_str)` — bulk archive path.** Never in the repo (written on the inaccessible machine), so PR 2 had nothing to delete. What it proved — stream the daily zip, one pass over the CSV — is what PR 3 re-implements in memory. No COPY, no staging table, no `statement_timeout` bump, because nothing is written server-side any more.
 
-**3c. Backfill loop** — `for i in range(20): load_day_from_archive(start + timedelta(days=i))` with `try/except` printing failures. **Known bug:** the `except` does not `conn.rollback()`, so one failed day (e.g. transient "read-only transaction") poisons the connection and every subsequent day fails with "current transaction is aborted". Fix written (`if conn: conn.rollback()`), never run. Days 13–16 July loaded before the cascade; DB died before the rerun.
+**3c. Backfill loop.** Never in the repo. The missing `conn.rollback()` requirement moved to PR 7, where backfill is re-implemented.
 
-**3d. Connection** — lazy: module-level `conn = None; cur = None`; `get_cursor()` connects on first call from `os.environ["CONNECTION_STRING"]` and reuses. Importing `ingest` has no side effects (that's what lets pure tests run without a DB). Report call is under `if __name__ == "__main__":`.
+**3d. Connection.** Moved out of `ingest.py` into `db.py`: `get_connection()` / `get_cursor()`, still lazy off `CONNECTION_STRING`, still no import-time side effects — importing `db` or `ingest` opens nothing, which is what lets the pure tests run with no database and no `.env`. `upsert_daily_levels` commits per call, so one session is one transaction (what PR 7's per-day rollback needs).
 
 ---
 
@@ -98,13 +89,23 @@ Session = UTC 00:00–24:00. Bucket = $25. Period = 30 min (48 periods, lettered
 
 ---
 
-## 6. Tests (`tests/test_engine.py`)
+## 6. Tests
 
+**`tests/test_engine.py`** — 5 pure unit tests, no DB and no network.
 - `test_tail_is_not_double_distribution` — synthetic single-distribution + long tail → False.
 - `test_genuine_double_distribution` — synthetic thick–thin–thick → True.
 - `test_classifies_directional_when_one_sided_no_trend` — classifier branch check.
-- `test_raises_on_missing_data` — integration; needs DB; asserts `ValueError` on an un-ingested date.
-- Run: `python -m pytest -v`. Pure tests pass with no `.env` (verified). No CI.
+- `test_poor_high_derives_from_day_high_and_poor_low_from_day_low`, `test_tails_are_none_when_no_single_print_buckets` — PR 1 fixes; both patch `get_profile_grid` and `detect_trend` so no database is touched.
+- `test_raises_on_missing_data` — **deleted in PR 2.** It asserted `ValueError` on an un-ingested date; with `trades` dropped every date raises, so the test could no longer fail and proved nothing.
+
+**`tests/test_db.py`** — PR 2 acceptance. 7 tests need a live database, 2 do not.
+- Schema: `schema.sql` applies to an empty namespace (a throwaway schema created inside a transaction that is rolled back, with `search_path` pointed only at it so the DROPs cannot reach `public`); its columns, nullability and PK match the constants in `db.py`; the BTCUSDT seed row is exact; `composites.days >= 2` is enforced.
+- Round trip: a fixture row upserts and reads back equal, JSONB included; a second upsert on the same `(symbol, session_date)` updates rather than duplicating; `get_instrument` returns the seeded config and `None` for an unknown symbol. These use `session_date = 1970-01-01` (no archive can ever exist for it) and delete the row before and after.
+- Pure: `upsert_daily_levels` rejects unknown column keys and requires the key columns.
+
+There is no `tests/conftest.py` — §1 used to claim one.
+
+Run: `python -m pytest -v`. **14 passed** locally with a database; **7 passed / 7 skipped** without one, which is what CI does (GitHub Actions, added in PR 1, provides no `CONNECTION_STRING`).
 
 ---
 
@@ -114,18 +115,18 @@ Session = UTC 00:00–24:00. Bucket = $25. Period = 30 min (48 periods, lettered
 - Backfill loop lacks `conn.rollback()` in the `except` (cascade failure). **Deferred, not fixed:** the loop and `load_day_from_archive` are not in the repo (§3b), so PR 1 had nothing to patch. The requirement moved to PR 7 (Scheduled warm-up), which is where backfill is re-implemented.
 
 **Architecture**
-- Raw ticks retained forever; engine only ever reads aggregates. Root cause of the outage. Decided direction: compute per-day levels on ingest → persist `daily_levels` → discard ticks.
-- Single ~300-line module holds ingestion, computation, and rendering.
-- Instrument config columns exist but bucket size (25), period (1800s), symbol, archive URL, and IB definition (periods 0–1) are all hardcoded.
+- ~~Raw ticks retained forever~~ — **closed in PR 2.** The tick tables are dropped, `daily_levels`/`composites` are the only storage, and nothing in the repo can write a tick. The producer that fills `daily_levels` arrives in PR 3.
+- Single module holds computation and rendering (~240 lines after PR 2 removed ingestion and connection handling). Splitting compute from rendering is still open.
+- Instrument config columns now exist in the shape the engine needs (`bucket_size`, `period_seconds`, `ib_periods`, `archive_url_template`) and are seeded — but engine code still hardcodes 25, 1800 and periods 0–1, in the two `ingest.py` queries that PR 3 replaces. Reading the columns is PR 3's job.
 - Session hardwired to UTC calendar day — no session-template concept.
-- REST path (ms) and archive path (µs) are two divergent code paths for the same table.
+- ~~REST path (ms) and archive path (µs) diverge~~ — **closed in PR 2** by deleting the REST path; PR 3 leaves a single archive path (µs).
 - `arr_single_tpo` is a flat list of bucket prices, not contiguous ranges — a consumer can't tell one single-print zone from three.
 
 **API**
 - Millisecond-epoch path parameter instead of dates; no instrument in the route; no listing/range/cross-day; no typed schemas; no caching; recomputes on every hit.
 
 **Ops**
-- Supabase project must be recreated from scratch (schema + tables). Railway service must be redeployed with the new `CONNECTION_STRING`. README URL/status may be stale.
+- ~~Supabase project must be recreated~~ — **closed in PR 2**, but by reuse rather than recreation (owner decision): the project came back, `db/schema.sql` replaced its contents, and `CONNECTION_STRING` therefore never changed, so Railway needs no new secret — only the redeploy it already needed. README still describes the v1 ingestion path and the `/profile/{ms}` routes; V2_SPEC assigns that rewrite to PR 4.
 - No scheduled ingestion — data only exists for days manually loaded.
 - No linting, no dependency pinning. (CI added in PR 1: GitHub Actions runs `python -m pytest` on push and pull request.)
 
@@ -134,7 +135,7 @@ Session = UTC 00:00–24:00. Bucket = $25. Period = 30 min (48 periods, lettered
 ## 8. What is genuinely done and should be preserved
 
 - The detector logic (POC tie-break, 70% VA expansion, IB, DD split with synthetic verification, one-timeframing confidence, classifier decision tree with reasons) — validated, keep.
-- The COPY → staging → INSERT…SELECT bulk-load pattern — correct, keep.
-- Lazy connection + `__main__` guard — keep.
+- The COPY → staging → INSERT…SELECT bulk-load pattern — correct for a tick store, but v2 has no tick store, so PR 2 kept only the idea (one streaming pass over the daily archive) and not the code. Recorded in git history and §3b.
+- Lazy connection (now in `db.py`) + `__main__` guard — kept.
 - `compute_structures` as the single source of truth feeding both JSON and text — keep the shape; it becomes the `daily_levels` row.
 - Dockerfile / Railway deploy path — keep.
