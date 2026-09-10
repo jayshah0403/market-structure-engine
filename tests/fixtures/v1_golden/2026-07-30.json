@@ -1,0 +1,29 @@
+{
+  "arr_single_tpo": [
+    63600.0,
+    63625.0,
+    63650.0,
+    64425.0,
+    64450.0,
+    65100.0,
+    65125.0,
+    65150.0,
+    65175.0
+  ],
+  "buying_tail": 63600.0,
+  "date": "2026-07-30",
+  "day_high": 65175.0,
+  "day_low": 63600.0,
+  "day_type": "Double-Distribution Trend",
+  "extension_above": 2.0,
+  "extension_below": 0.0,
+  "ib_high": 64125.0,
+  "ib_low": 63600.0,
+  "poc": 64825.0,
+  "poor_high": null,
+  "poor_low": null,
+  "reason": "Two distributions separated by single prints",
+  "selling_tail": 65175.0,
+  "vah": 65175.0,
+  "val": 64225.0
+}

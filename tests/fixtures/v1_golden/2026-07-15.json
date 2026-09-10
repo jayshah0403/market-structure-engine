@@ -1,0 +1,21 @@
+{
+  "arr_single_tpo": [
+    65600.0
+  ],
+  "buying_tail": null,
+  "date": "2026-07-15",
+  "day_high": 65600.0,
+  "day_low": 64475.0,
+  "day_type": "Neutral",
+  "extension_above": 1.8333333333333333,
+  "extension_below": 0.9166666666666666,
+  "ib_high": 65050.0,
+  "ib_low": 64750.0,
+  "poc": 64825.0,
+  "poor_high": null,
+  "poor_low": 64475.0,
+  "reason": "Extended both sides (1.8x up, 0.9x down) \u2014 two-sided, responsive",
+  "selling_tail": 65600.0,
+  "vah": 65100.0,
+  "val": 64600.0
+}
