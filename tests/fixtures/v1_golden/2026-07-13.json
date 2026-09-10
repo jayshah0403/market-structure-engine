@@ -1,0 +1,32 @@
+{
+  "arr_single_tpo": [
+    61800.0,
+    61825.0,
+    61850.0,
+    64225.0,
+    64250.0,
+    64275.0,
+    64300.0,
+    64325.0,
+    64350.0,
+    64375.0,
+    64400.0,
+    64425.0
+  ],
+  "buying_tail": 61800.0,
+  "date": "2026-07-13",
+  "day_high": 64425.0,
+  "day_low": 61800.0,
+  "day_type": "Directional (unclassified)",
+  "extension_above": 0.0,
+  "extension_below": 2.0,
+  "ib_high": 64425.0,
+  "ib_low": 63550.0,
+  "poc": 62750.0,
+  "poor_high": null,
+  "poor_low": null,
+  "reason": "Extended 2.0x IB to the down; one-timeframing 0.60 \u2014 directional but not a clean trend",
+  "selling_tail": 64425.0,
+  "vah": 63150.0,
+  "val": 62025.0
+}

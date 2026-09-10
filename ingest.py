@@ -1,25 +1,21 @@
-import requests
-import psycopg2
-import os
-# pyrefly: ignore [missing-import]
-from dotenv import load_dotenv
-from psycopg2.extras import execute_values
+"""v1 engine: profile computation, detectors, classifier, report.
+
+PR 2 is storage only, so two functions here are knowingly left pointing at the
+dropped `trades` table: `get_profile_grid` and `detect_trend`. PR 3 replaces both
+with the in-memory archive path (`aggregate_archive` / `detect_trend(period_ranges)`),
+which is why they are not deleted now — everything downstream of them still needs
+its current call shape until that PR lands. Until then `compute_structures` fails
+against the live database; the pure detector tests and the v1 golden fixtures in
+tests/fixtures/v1_golden/ are what cover this code in the meantime.
+"""
+
 from collections import defaultdict
 import string
 from datetime import datetime, timezone
 
-
-conn = None
-cur = None
-
-load_dotenv()
-
-def get_cursor():
-    global conn, cur
-    if cur is None:
-        conn = psycopg2.connect(os.environ["CONNECTION_STRING"])
-        cur = conn.cursor()
-    return cur
+# Connection handling lives in db.py (V2_SPEC PR 2). The requests / psycopg2 /
+# execute_values imports went with the v1 tick-ingestion path: v2 writes no ticks.
+from db import get_cursor
 
 letters = string.ascii_uppercase + string.ascii_lowercase
 
@@ -41,33 +37,6 @@ def get_profile_grid(start_ts_ms):
     """, (start_ts_ms, end_ts_ms))
     rows = cur.fetchall()
     return rows
-
-def fetchDayRecords(date):
-    cur = get_cursor()
-    cur.execute("SELECT id FROM instruments WHERE symbol = %s", ("BTCUSDT",))
-    instrument_id = cur.fetchone()[0]
-    start_timestamp = date
-    end_time = date + 86400000
-    first_trade = requests.get("https://api.binance.com/api/v3/aggTrades", params={"symbol": "BTCUSDT", "startTime": start_timestamp, "limit": 1}).json()
-    from_id = first_trade[0]['a']
-    while True:
-        response = requests.get("https://api.binance.com/api/v3/aggTrades", params={"symbol": "BTCUSDT", "fromId": from_id, "limit": 1000}).json()
-        if len(response) == 0:
-            break
-        batch = [t for t in response if t['T'] <= end_time]
-        if batch:
-            rows = [(t['a'], instrument_id, t['p'], t['q'], t['T'], t['m']) for t in batch]
-            execute_values(cur, "INSERT INTO trades (agg_trade_id, instrument_id, price, quantity, ts, is_buyer_maker) "
-                "VALUES %s ON CONFLICT (agg_trade_id) DO NOTHING",
-                rows,
-                template="(%s, %s, %s, %s, to_timestamp(%s / 1000.0), %s)")
-            conn.commit()
-
-        if response[-1]['T'] > end_time:
-            break
-        from_id = response[-1]['a'] + 1
-        if len(response) < 1000:
-            break
 
 def compute_profile(start_timestamp):
     lst = get_profile_grid(start_timestamp)

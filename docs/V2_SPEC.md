@@ -111,9 +111,9 @@ Seed: BTCUSDT only. **[DECIDE]** any second instrument at launch (ETHUSDT?) — 
 
 ### PR 2 — New data layer
 
-**What.** Fresh Supabase project. Create `instruments`, `daily_levels`, `composites` (DDL in `db/schema.sql`, committed). Seed BTCUSDT. Remove `trades`, `staging_trades`, `fetchDayRecords`, `load_day_from_archive`, and the COPY/staging code from the codebase (they live in git history).
+**What.** ~~Fresh Supabase project.~~ **Reuse the existing Supabase project** (owner decision at PR 2: it is reachable again, so it was re-schemad in place rather than recreated; `db/schema.sql` drops the v1 tick tables at the top, which is what relieves the disk pressure). Create `instruments`, `daily_levels`, `composites` (DDL in `db/schema.sql`, committed). Seed BTCUSDT. Remove `trades`, `staging_trades`, `fetchDayRecords`, `load_day_from_archive`, and the COPY/staging code from the codebase (they live in git history).
 
-**Interface.** `db.py` module: `get_connection()` (lazy, from `CONNECTION_STRING`), `get_daily_levels(symbol, date)`, `upsert_daily_levels(row)`, `list_daily_levels(symbol, from, to)`, `get_instrument(symbol)`.
+**Interface.** `db.py` module: `get_connection()` (lazy, from `CONNECTION_STRING`), `get_daily_levels(symbol, date)`, `upsert_daily_levels(row)`, `list_daily_levels(symbol, from_date, to_date)` (`from` is a Python keyword — the signature reads `from_date`/`to_date`, inclusive), `get_instrument(symbol)`. `get_cursor()` moves here from `ingest.py`. Reads return plain dicts with NUMERIC as `float`, JSONB parsed, dates as `date`.
 
 **Rules.**
 - Schema exactly as §2. Upsert keyed on `(symbol, session_date)`.
@@ -122,8 +122,8 @@ Seed: BTCUSDT only. **[DECIDE]** any second instrument at launch (ETHUSDT?) — 
 **Acceptance.**
 - `schema.sql` applies cleanly to an empty database.
 - Round-trip test: upsert a fixture row → read it back equal (including JSONB fields).
-- Repo contains no reference to `trades`/`staging_trades`/COPY.
-- Railway `CONNECTION_STRING` updated; `/health` (added in PR 4) will verify.
+- No reference to `staging_trades` or the COPY/staging path anywhere in the repo, and no code that writes ticks. **Two `FROM trades` queries remain, in `ingest.py`'s `get_profile_grid` and `detect_trend`:** PR 3 replaces both with the in-memory archive path, and deleting them in PR 2 would mean deleting `compute_structures`, `api.py`'s two routes and the PR 1 acceptance tests a PR early. They are documented as dead-until-PR-3 in the `ingest.py` docstring. `scripts/capture_v1_golden.py` also names `trades` by necessity — it is the one-shot that read the table before it was dropped.
+- Railway `CONNECTION_STRING` needs no change (same project reused, same credentials); the redeploy Railway already needed is still outstanding and `/health` (added in PR 4) will verify it.
 
 ---
 
