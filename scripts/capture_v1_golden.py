@@ -1,7 +1,7 @@
 """Capture the v1 (Postgres-backed) compute_structures output for every UTC day
 present in `trades`, as PR 3's regression baseline.
 
-Run this BEFORE `db/schema.sql` drops `trades`: it is the only way to preserve
+Run this BEFORE `sql/001_drop_v1.sql` drops `trades`: it is the only way to preserve
 what the v1 SQL path produced. Once the table is gone the script cannot be
 re-run — it is committed as the provenance record for
 `tests/fixtures/v1_golden/*.json`, not as a reusable tool.

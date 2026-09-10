@@ -14,10 +14,11 @@ import pytest
 
 import db
 
-SCHEMA_SQL_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "db", "schema.sql",
-)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCHEMA_SQL_PATH = os.path.join(REPO_ROOT, "sql", "schema.sql")
+# Already applied; here only so the separation between the two files can be
+# asserted. No test ever executes it.
+DROP_SQL_PATH = os.path.join(REPO_ROOT, "sql", "001_drop_v1.sql")
 
 needs_db = pytest.mark.skipif(
     "CONNECTION_STRING" not in os.environ,
@@ -35,10 +36,10 @@ def empty_schema():
     """A throwaway, empty Postgres schema, rolled back afterwards.
 
     schema.sql is applied inside a transaction against a fresh schema whose name
-    is the only entry on the search_path, so the DDL runs against an empty
-    namespace and cannot see - let alone drop - anything in `public`. Postgres
-    makes DDL transactional, so the rollback removes the schema and everything
-    created in it; the test leaves no trace.
+    is the only entry on the search_path, so its CREATEs and the FKs between them
+    resolve inside that namespace and cannot touch `public`. Postgres makes DDL
+    transactional, so the rollback removes the schema and everything created in
+    it; the test leaves no trace.
     """
     import psycopg2
 
@@ -84,6 +85,39 @@ def test_schema_applies_cleanly_to_an_empty_database(empty_schema):
     assert [row[0] for row in cur.fetchall()] == [
         "composites", "daily_levels", "instruments",
     ]
+
+
+@needs_db
+def test_schema_is_idempotent(empty_schema):
+    """Re-applying schema.sql must be a no-op, not an error or a data loss.
+
+    This is what makes it safe to run against the live database once
+    daily_levels holds rows that cost 10-30 s each to recompute.
+    """
+    cur, schema = empty_schema
+    _apply_schema(cur)
+    cur.execute("INSERT INTO daily_levels (symbol, session_date, engine_version,"
+                " day_type, reason, poc, vah, val, ib_high, ib_low, day_high,"
+                " day_low, extension_above, extension_below, up_conf, down_conf,"
+                " single_prints, profile)"
+                " VALUES ('BTCUSDT', '2026-07-27', 1, 'Neutral', 'fixture',"
+                " 1, 1, 1, 1, 1, 1, 1, 0, 0, 0.5, 0.5, '[]', '{}')")
+
+    _apply_schema(cur)  # second application, same transaction
+
+    cur.execute(
+        "SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema = %s ORDER BY table_name",
+        (schema,),
+    )
+    assert [row[0] for row in cur.fetchall()] == [
+        "composites", "daily_levels", "instruments",
+    ]
+    # The computed row survived, and the seed did not double up.
+    cur.execute("SELECT count(*) FROM daily_levels")
+    assert cur.fetchone()[0] == 1
+    cur.execute("SELECT count(*) FROM instruments")
+    assert cur.fetchone()[0] == 1
 
 
 @needs_db
@@ -247,6 +281,39 @@ def test_get_instrument_reads_the_seeded_engine_config():
     assert instrument["ib_periods"] == 2
     assert "{symbol}" in instrument["archive_url_template"]
     assert db.get_instrument("NOPE") is None
+
+
+# --- the two SQL files stay separated (no database) -------------------------
+
+def _statements(path):
+    """The file's SQL with comment lines stripped, lowercased."""
+    with open(path, encoding="utf-8") as handle:
+        lines = [line for line in handle
+                 if not line.lstrip().startswith("--")]
+    return " ".join(lines).lower()
+
+
+def test_schema_sql_contains_no_destructive_statement():
+    """Destructive and constructive statements must not share a script.
+
+    schema.sql is re-runnable, so nothing in it may destroy anything: the v1
+    teardown lives in sql/001_drop_v1.sql. Comment lines are stripped first -
+    the header talks about dropping without doing any.
+    """
+    sql = _statements(SCHEMA_SQL_PATH)
+
+    for statement in ("drop ", "truncate", "delete from", "alter table"):
+        assert statement not in sql, statement
+    assert sql.count("create table if not exists") == 3
+    assert "on conflict (symbol) do nothing" in sql
+
+
+def test_drop_script_contains_no_constructive_statement():
+    sql = _statements(DROP_SQL_PATH)
+
+    assert "drop table if exists trades, staging_trades, instruments;" in sql
+    for statement in ("create ", "insert "):
+        assert statement not in sql, statement
 
 
 # --- validation (no database) ----------------------------------------------
