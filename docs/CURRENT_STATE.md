@@ -17,7 +17,7 @@ Baseline document. Everything the system does today, how it does it, and the deb
 | `api.py` | The HTTP layer: 5 typed `/v1` routes, cache-then-compute, rate limiting and the cold-compute cap. The only module that imports FastAPI | Rewritten in PR 4. Pydantic response models live here; the engine still returns plain dicts |
 | `tests/test_engine.py`, `tests/test_db.py`, `tests/test_compute.py`, `tests/test_api.py`, `pytest.ini` | 5 pure detector tests, 12 storage tests (8 needing a database), 36 compute tests (26 pure, 9 needing network + a database, 1 slow), 31 pure endpoint tests. `pytest.ini` registers the `network` and `slow` markers. There is no `conftest.py` | 84 pass locally; 66 pass / 18 skip with neither network nor database, which is what CI runs |
 | `Dockerfile`, `.dockerignore`, `requirements.txt` | `python:3.13-slim`, deps: fastapi, uvicorn, psycopg2-binary, requests, python-dotenv; `.env` excluded from image | Working |
-| Railway | Hosts the container; `CONNECTION_STRING` injected as env var | **Paid plan active (Sept 2026); service was offline after trial expiry — needs redeploy** |
+| Railway | Hosts the container; `CONNECTION_STRING` injected as env var | **LIVE on the v2 build (2026-09-11).** The service had stayed on the old build because **auto-deploy was disabled**, not because of the trial expiry — re-enabling it redeployed from `main`. Verified: `/v1/health` → `{"status":"ok","db":"ok","engine_version":1}` |
 | Supabase (Postgres 17.6, free tier, t4g.nano, ap-southeast-2) | The only data store | **LIVE** — the same project, reachable again (owner decision at PR 2: reuse, do not recreate). `sql/001_drop_v1.sql` dropped the tick tables and `sql/schema.sql` created the v2 schema: 855 MB → 10 MB, so the disk pressure that killed it is gone. `CONNECTION_STRING` is unchanged. |
 | `README.md` | Pitch + `/v1` endpoints + setup, including the T+1 archive caveat and the ~20 s cold-miss latency | Rewritten in PR 4. Links the Railway URL |
 
@@ -102,7 +102,19 @@ The only module that imports FastAPI. Every route is typed, so `/docs` renders r
 
 **Errors.** The engine raises `SessionNotPublished`, `NoTradeData`, `UnknownInstrument` and `ArchiveUnavailable`; this layer is the only place they become status codes. Owner decision at PR 4: `SessionNotPublished` for a past date is a `404`, the same condition as asking for today, while `ArchiveUnavailable` is a `503`.
 
-**Not done here.** The Railway redeploy that would let `/v1/health` answer `db: ok` in production is still outstanding — it needs the owner's hand on the deploy, and V2_SPEC PR 4's last acceptance bullet stays open until then.
+**Deployed and verified (2026-09-11).** V2_SPEC PR 4's last acceptance bullet — "Deployed on Railway with the new DB; `/v1/health` returns `db: ok`" — **is met**, so every acceptance criterion for PR 4 now passes. The service had been serving the old build because auto-deploy was disabled; enabling it redeployed from `main`. Checked against the live URL:
+
+| Request | Result |
+|---|---|
+| `GET /v1/health` | `200` `{"status":"ok","db":"ok","engine_version":1}` |
+| `GET /v1/instruments` | `200`, the BTCUSDT seed with its real `archive_url_template` |
+| `GET /v1/sessions/BTCUSDT/2026-07-27` | `200` in 0.45 s — a cache hit, `computed_at` still the original `2026-09-11T01:34:35Z`. POC 65200, VA 64750–65425, IB 65050–65400 and `day_type` Neutral all equal `tests/fixtures/v1_golden/2026-07-27.json`, so the deployed service reproduces the retired v1 SQL path end to end |
+| `GET /v1/sessions/BTCUSDT/<today>` | `404` |
+| `GET /v1/sessions/BTCUSDT/not-a-date` | `422` |
+| `GET /v1/sessions/NOPE/2026-07-27` | `404` |
+| `GET /v1/sessions/BTCUSDT?from=2025-01-01&to=2026-01-01` | `422` — 366 days, one past `MAX_RANGE_DAYS` |
+
+The last row also confirms the running build is `main` **after** the PR 4 review merge, not the first cut.
 
 ---
 
@@ -168,7 +180,7 @@ Run: `python -m pytest -v`. **84 passed** locally (the 8 parity days download ~1
 - **`tests/test_db.py` writes to the configured database.** The round-trip tests delete, upsert, commit and delete a `daily_levels` row against whatever `CONNECTION_STRING` points at — in practice the live Supabase project. It is deliberate and bounded: what they cover *is* `upsert_daily_levels` and psycopg2's JSONB round-trip, which a fake would not exercise, and they use `session_date = 1970-01-01`, a date no archive can ever exist for, deleting the row before and after. The debt is that a live credential plus an interrupted run can still leave a stray row in production storage, and that nothing stops the same tests being pointed at a real database by accident. Every other test in the repo is now pure — PR 3 removed the parity tests' writes and PR 4's endpoint tests never had any — so this is the last writer. Options when it is addressed: a dedicated test database in CI, or applying `schema.sql` to a throwaway schema and pointing the round trip at that.
 
 **Ops**
-- ~~Supabase project must be recreated~~ — **closed in PR 2**, but by reuse rather than recreation (owner decision): the project came back, `sql/001_drop_v1.sql` + `sql/schema.sql` replaced its contents, and `CONNECTION_STRING` therefore never changed, so Railway needs no new secret — only the redeploy it already needed. ~~README still describes the v1 ingestion path and the `/profile/{ms}` routes~~ — **closed in PR 4**, which rewrote it for the `/v1` routes, the T+1 archive caveat and the ~20 s cold-miss latency. The Railway **redeploy is still outstanding**, so the live URL still serves the old build.
+- ~~Supabase project must be recreated~~ — **closed in PR 2**, but by reuse rather than recreation (owner decision): the project came back, `sql/001_drop_v1.sql` + `sql/schema.sql` replaced its contents, and `CONNECTION_STRING` therefore never changed, so Railway needs no new secret — only the redeploy it already needed. ~~README still describes the v1 ingestion path and the `/profile/{ms}` routes~~ — **closed in PR 4**, which rewrote it for the `/v1` routes, the T+1 archive caveat and the ~20 s cold-miss latency. ~~The Railway redeploy is still outstanding~~ — **closed 2026-09-11.** The cause was **auto-deploy being disabled**, so pushes to `main` never reached the platform; the paid plan and `CONNECTION_STRING` were never the problem. Enabling auto-deploy redeployed from `main` and the live URL now serves the v2 build (§5 has the verification).
 - No scheduled ingestion — data only exists for days computed on demand. The 8 golden days are cached in `daily_levels` as a side effect of the parity test; everything else is a cache miss until PR 7's warm-up.
 - No linting, no dependency pinning. (CI added in PR 1: GitHub Actions runs `python -m pytest` on push and pull request.)
 
