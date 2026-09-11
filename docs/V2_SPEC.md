@@ -135,7 +135,7 @@ Seed: BTCUSDT only. **[DECIDE]** any second instrument at launch (ETHUSDT?) — 
 **Interface.**
 ```python
 def compute_day(symbol: str, session_date: date) -> DailyLevels:   # pure compute + persist
-def aggregate_archive(csv_stream, bucket_size, period_seconds) -> tuple[dict[float, set[int]], dict[int, tuple[float, float]]]
+def aggregate_archive(csv_stream, bucket_size, period_seconds, session_date) -> tuple[dict[float, set[int]], dict[int, tuple[float, float]]]
     # returns profile {bucket: set(periods)} and period_ranges {period: (high, low)}
 ```
 *As built (PR 3):* `DailyLevels` is a plain `dict` keyed on `daily_levels` columns, not a class — a Pydantic model in the engine would put a web dependency below the API layer, and PR 4 is where the response models live. Two helpers came with it: `open_archive_csv(url)`, a context manager yielding the zip's CSV as a text stream, and `single_print_ranges(buckets, bucket_size)`. `compute_structures` is no longer `compute_structures(start_ts)`: it takes `(profile, period_ranges, symbol, session_date, bucket_size, ib_periods)` and returns the row.
@@ -144,7 +144,8 @@ def aggregate_archive(csv_stream, bucket_size, period_seconds) -> tuple[dict[flo
 - Download `archive_url_template` for the symbol/date. On HTTP 404 → raise `SessionNotPublished` (archive appears ~02:00 UTC next day).
 - Parse CSV **in chunks** (`csv` module over a `TextIOWrapper`, or `pandas.read_csv(chunksize=…)`). Never load the full file into one DataFrame. Accumulator state is bounded by buckets × periods.
 - Column positions (headerless): `[0]=agg_trade_id, [1]=price, [2]=qty, [5]=timestamp_micro, [6]=is_buyer_maker`. Timestamp is **microseconds**.
-- `bucket = floor(price / bucket_size) * bucket_size`; `period = floor(seconds_since_utc_midnight / period_seconds)`.
+- `bucket = floor(price / bucket_size) * bucket_size`; `period = floor(seconds_into_session / period_seconds)`.
+- **Session window.** Only rows inside the half-open window `[session_date 00:00 UTC, session_date + 1 day 00:00 UTC)` are aggregated; rows outside it are dropped, reproducing v1's `WHERE` clause. *Correction (PR 3 follow-up):* the signature above gained `session_date` for this. As first built, `aggregate_archive` took no date and derived the period by folding the timestamp modulo one day, which relabelled an out-of-day row as a period of *this* day rather than excluding it — raised as ambiguity 4 on the PR and closed here. The period is now an offset into the session, so correctness no longer depends on the archive file holding exactly one day.
 - Existing detectors (`compute_poc`, `compute_value_area`, `compute_ib`, `segment_profile`, `detect_double_distribution_split`, `classify_day_type`) are called **unchanged** on the in-memory profile. `detect_trend` is refactored to take `period_ranges` instead of running SQL.
   - *Correction (PR 3):* `compute_ib` could not stay literally unchanged — it hardcoded "period 0 or 1", which contradicts §4's rule that `ib_periods` comes from `instruments`. It gained one parameter, `compute_ib(profile, ib_periods=2)`; the body's logic is untouched and the default reproduces v1 exactly. Every other detector is called with its v1 signature.
 - `single_prints` are emitted as contiguous ranges.
@@ -156,6 +157,7 @@ def aggregate_archive(csv_stream, bucket_size, period_seconds) -> tuple[dict[flo
 - Regression test: `compute_day("BTCUSDT", 2026-07-27)` reproduces the v1 Postgres-path values recorded in CURRENT_STATE (POC/VA/IB within one bucket). *Met more strictly (PR 3): all 8 golden days, exact equality on every bucket-valued field, not within one bucket.*
 - Unit test: `detect_trend(period_ranges)` gives identical output to the old SQL version on a fixture. **Parity is exact equality on `day_type` *and* the `reason` string** against `tests/fixtures/v1_golden/<date>.json` (owner decision at PR 2): `up_conf`/`down_conf` reach the output only through the Trend and Directional branches of `classify_day_type`, which embed the value in `reason`, and the Neutral / Non-Trend / Double-Distribution branches short-circuit before either value is read — so matching `day_type` + `reason` is full parity, and the confidences need no separate capture.
 - Unit test: unpublished date → `SessionNotPublished`, no partial row written.
+- Window test (PR 3 follow-up): a fixture CSV holding one row timestamped just after midnight of the following day aggregates to exactly the same profile and period ranges as the same file without that row; aggregated as the *next* session the same row is kept, so the exclusion is the window and not a parse failure. Both edges of the half-open window are asserted.
 
 ---
 

@@ -40,6 +40,18 @@ Each (bucket, period) cell emits REPEATS x len(PRICE_OFFSETS) trades at prices
 inside the bucket — including bucket+0.01 and bucket+24.99, so the fixture also
 proves that flooring puts both edges of a bucket in the same bucket. Rows come
 out in timestamp order, like a real archive.
+
+Timestamps are offsets from epoch midnight, so **the fixture's session date is
+1970-01-01** — that is the date aggregate_archive has to be given to place these
+rows inside the session window.
+
+A second fixture, synthetic_day_with_stray_row.csv, is the same 312 rows plus
+one row timestamped 00:00:00.000001 on 1970-01-02 at a price far outside the
+day's range. It falls outside the half-open window [session, session + 1 day),
+so aggregate_archive must drop it and return exactly the first fixture's
+profile. Folded in by a modulo instead — what the code did before the window was
+applied — it would land in period 0 and move day_high from 63300 to 99975, so a
+regression fails loudly rather than subtly.
 """
 
 import os
@@ -66,10 +78,21 @@ PERIOD_SECONDS = 1800
 PRICE_OFFSETS = ("0.01", "8.33", "16.66", "24.99")
 REPEATS = 3
 
-OUT_PATH = os.path.join(
+FIXTURE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tests", "fixtures", "synthetic_day.csv",
+    "tests", "fixtures",
 )
+OUT_PATH = os.path.join(FIXTURE_DIR, "synthetic_day.csv")
+STRAY_OUT_PATH = os.path.join(FIXTURE_DIR, "synthetic_day_with_stray_row.csv")
+
+# One microsecond past midnight of the following day: the first timestamp the
+# half-open window [session, session + 1 day) must exclude.
+STRAY_TS_MICRO = 86_400 * 1_000_000 + 1
+# Far outside the day's 62950-63300 range, so a wrongly included row cannot be
+# mistaken for a rounding difference.
+STRAY_PRICE = "99999.99000000"
+STRAY_ROW = "4000000313,%s,0.05000000,4000000313,4000000313,%d,False,True" % (
+    STRAY_PRICE, STRAY_TS_MICRO)
 
 
 def rows():
@@ -105,12 +128,17 @@ def rows():
                 "True" if index % 2 else "False")
 
 
-def main():
-    lines = list(rows())
-    with open(OUT_PATH, "w", encoding="utf-8", newline="\n") as handle:
+def write(path, lines):
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
         for line in lines:
             handle.write(line + "\n")
-    print("wrote %s (%d rows)" % (os.path.relpath(OUT_PATH), len(lines)))
+    print("wrote %s (%d rows)" % (os.path.relpath(path), len(lines)))
+
+
+def main():
+    lines = list(rows())
+    write(OUT_PATH, lines)
+    write(STRAY_OUT_PATH, lines + [STRAY_ROW])
 
 
 if __name__ == "__main__":

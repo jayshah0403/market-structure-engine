@@ -14,6 +14,7 @@ No FastAPI import here, and no HTTP status codes: failures raise the engine's ow
 exceptions and the API layer decides what they mean (V2_SPEC section 4, "Errors").
 """
 
+import calendar
 import contextlib
 import csv
 import io
@@ -125,8 +126,8 @@ def open_archive_csv(url):
         response.close()
 
 
-def aggregate_archive(csv_stream, bucket_size, period_seconds):
-    """One streaming pass over the archive CSV.
+def aggregate_archive(csv_stream, bucket_size, period_seconds, session_date):
+    """One streaming pass over the archive CSV, windowed to one session.
 
     Returns `(profile, period_ranges)`:
       * `profile` — `{bucket: {periods touched}}`, the TPO profile.
@@ -143,9 +144,24 @@ def aggregate_archive(csv_stream, bucket_size, period_seconds):
     `[0]=agg_trade_id [1]=price [2]=quantity [5]=timestamp_micro
     [6]=is_buyer_maker`. The timestamp is **microseconds** — the trap recorded in
     CURRENT_STATE 3b, where the retired REST path used milliseconds.
+
+    `session_date` bounds the pass to the half-open window
+    `[session_date 00:00 UTC, session_date + 1 day 00:00 UTC)`; rows outside it
+    are dropped. This is v1's `WHERE` clause, restored. Without a date the
+    period could only be derived by folding the timestamp with a modulo over
+    seconds-since-epoch, which silently relabelled an out-of-day row as a period
+    of *this* day instead of excluding it — the divergence from v1 recorded as
+    ambiguity 4 on the PR. The period is now an offset into the session, so it
+    no longer depends on the archive file happening to hold exactly one day.
     """
     bucket_size = float(bucket_size)
     period_seconds = int(period_seconds)
+    # calendar.timegm reads the tuple as UTC; datetime.timestamp() would apply
+    # the local zone, which would shift the window by the offset of whatever
+    # machine ran it.
+    session_start_micro = (
+        calendar.timegm(session_date.timetuple()) * MICROSECONDS_PER_SECOND)
+    session_end_micro = session_start_micro + SECONDS_PER_DAY * MICROSECONDS_PER_SECOND
     profile = {}
     period_ranges = {}
 
@@ -161,9 +177,15 @@ def aggregate_archive(csv_stream, bucket_size, period_seconds):
             raise ValueError(
                 "malformed archive row %d: %r" % (row_number + 1, row))
 
+        # Half-open, so a trade at exactly the next midnight belongs to the next
+        # session and is counted once, there, not twice.
+        if not session_start_micro <= ts_micro < session_end_micro:
+            continue
+
         bucket = math.floor(price / bucket_size) * bucket_size
-        seconds_since_midnight = (ts_micro // MICROSECONDS_PER_SECOND) % SECONDS_PER_DAY
-        period = seconds_since_midnight // period_seconds
+        seconds_into_session = (
+            (ts_micro - session_start_micro) // MICROSECONDS_PER_SECOND)
+        period = seconds_into_session // period_seconds
 
         periods = profile.get(bucket)
         if periods is None:
@@ -216,7 +238,8 @@ def compute_day(symbol, session_date):
 
     with open_archive_csv(archive_url(instrument, session_date)) as csv_stream:
         profile, period_ranges = aggregate_archive(
-            csv_stream, instrument["bucket_size"], instrument["period_seconds"])
+            csv_stream, instrument["bucket_size"], instrument["period_seconds"],
+            session_date)
 
     row = compute_structures(
         profile, period_ranges,

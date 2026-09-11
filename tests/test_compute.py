@@ -31,6 +31,11 @@ import ingest
 FIXTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 V1_GOLDEN_DIR = os.path.join(FIXTURE_DIR, "v1_golden")
 SYNTHETIC_CSV = os.path.join(FIXTURE_DIR, "synthetic_day.csv")
+# Same 312 rows plus one timestamped just past midnight of the following day.
+SYNTHETIC_STRAY_CSV = os.path.join(FIXTURE_DIR, "synthetic_day_with_stray_row.csv")
+# Both fixtures' timestamps are offsets from epoch midnight, so the session they
+# describe is 1970-01-01 (scripts/make_synthetic_day.py).
+SYNTHETIC_SESSION = datetime.date(1970, 1, 1)
 
 IN_CI = os.environ.get("CI", "").strip().lower() in ("1", "true", "yes")
 
@@ -98,7 +103,8 @@ def test_aggregate_archive_reads_the_synthetic_fixture():
     known by construction rather than by running the code under test.
     """
     with open(SYNTHETIC_CSV, newline="", encoding="utf-8") as handle:
-        profile, period_ranges = ingest.aggregate_archive(handle, 25, 1800)
+        profile, period_ranges = ingest.aggregate_archive(
+            handle, 25, 1800, SYNTHETIC_SESSION)
 
     # 100.0 is not a bucket here: prices start at 63000 and bucket_size is 25.
     assert min(profile) == 62950.0
@@ -115,7 +121,8 @@ def test_aggregate_archive_reads_the_synthetic_fixture():
 def test_synthetic_day_has_known_structures():
     """V2_SPEC PR 3 acceptance: fixture CSV -> known POC/VAH/VAL/IB."""
     with open(SYNTHETIC_CSV, newline="", encoding="utf-8") as handle:
-        profile, period_ranges = ingest.aggregate_archive(handle, 25, 1800)
+        profile, period_ranges = ingest.aggregate_archive(
+            handle, 25, 1800, SYNTHETIC_SESSION)
 
     row = ingest.compute_structures(
         profile, period_ranges,
@@ -157,7 +164,8 @@ def test_bucket_and_period_are_computed_from_the_configured_values():
         _csv_line(3, "62999.99000000", "0.5", 1800 * 1_000_000),
     ]
 
-    profile, period_ranges = ingest.aggregate_archive(iter(rows), 25, 1800)
+    profile, period_ranges = ingest.aggregate_archive(
+        iter(rows), 25, 1800, SYNTHETIC_SESSION)
 
     assert profile == {63000.0: {0}, 63025.0: {0}, 62975.0: {1}}
     assert period_ranges == {0: (63037.99, 63012.34), 1: (62999.99, 62999.99)}
@@ -167,7 +175,8 @@ def test_period_width_comes_from_period_seconds():
     rows = [_csv_line(1, "63000.0", "1", 3599 * 1_000_000),
             _csv_line(2, "63000.0", "1", 3600 * 1_000_000)]
 
-    _profile, hourly = ingest.aggregate_archive(iter(rows), 25, 3600)
+    _profile, hourly = ingest.aggregate_archive(
+        iter(rows), 25, 3600, SYNTHETIC_SESSION)
 
     assert set(hourly) == {0, 1}
 
@@ -175,8 +184,10 @@ def test_period_width_comes_from_period_seconds():
 def test_bucket_size_is_not_hardcoded():
     rows = [_csv_line(1, "63010.0", "1", 0)]
 
-    assert ingest.aggregate_archive(iter(rows), 10, 1800)[0] == {63010.0: {0}}
-    assert ingest.aggregate_archive(iter(rows), 100, 1800)[0] == {63000.0: {0}}
+    assert ingest.aggregate_archive(
+        iter(rows), 10, 1800, SYNTHETIC_SESSION)[0] == {63010.0: {0}}
+    assert ingest.aggregate_archive(
+        iter(rows), 100, 1800, SYNTHETIC_SESSION)[0] == {63000.0: {0}}
 
 
 def test_timestamps_are_microseconds_not_milliseconds():
@@ -187,7 +198,8 @@ def test_timestamps_are_microseconds_not_milliseconds():
     """
     rows = [_csv_line(1, "63000.0", "1", 86399 * 1_000_000)]
 
-    _profile, period_ranges = ingest.aggregate_archive(iter(rows), 25, 1800)
+    _profile, period_ranges = ingest.aggregate_archive(
+        iter(rows), 25, 1800, SYNTHETIC_SESSION)
 
     assert set(period_ranges) == {47}
 
@@ -197,13 +209,91 @@ def test_a_header_row_is_tolerated_but_later_junk_is_not():
     header = "agg_trade_id,price,quantity,first,last,transact_time,is_buyer_maker,is_best_match"
     rows = [header, _csv_line(1, "63000.0", "1", 0)]
 
-    profile, _ranges = ingest.aggregate_archive(iter(rows), 25, 1800)
+    profile, _ranges = ingest.aggregate_archive(iter(rows), 25, 1800, SYNTHETIC_SESSION)
     assert profile == {63000.0: {0}}
 
     with pytest.raises(ValueError):
         ingest.aggregate_archive(
             iter([_csv_line(1, "63000.0", "1", 0), "not,a,valid,row,at,all,x,y"]),
-            25, 1800)
+            25, 1800, SYNTHETIC_SESSION)
+
+
+# --- the session window -------------------------------------------------------
+
+def test_a_row_after_midnight_is_dropped_from_the_session():
+    """A row outside the session window is excluded, not folded into a period.
+
+    The two fixtures differ by exactly one row, timestamped 00:00:00.000001 on
+    1970-01-02 at 99999.99 — outside the half-open window [session, session + 1
+    day), which is what v1's WHERE clause enforced. Aggregating them for
+    1970-01-01 must therefore give the same answer.
+
+    Before the window was applied the period came from a modulo over
+    seconds-since-epoch, which folded that row into period 0 and moved day_high
+    from 63300 to 99975.
+    """
+    with open(SYNTHETIC_CSV, newline="", encoding="utf-8") as handle:
+        expected, expected_ranges = ingest.aggregate_archive(
+            handle, 25, 1800, SYNTHETIC_SESSION)
+
+    with open(SYNTHETIC_STRAY_CSV, newline="", encoding="utf-8") as handle:
+        actual, actual_ranges = ingest.aggregate_archive(
+            handle, 25, 1800, SYNTHETIC_SESSION)
+
+    assert actual == expected
+    assert actual_ranges == expected_ranges
+    # Specifically: the stray row's bucket is absent and the day's high stands.
+    assert 99975.0 not in actual
+    assert max(actual) == 63300.0
+
+
+def test_the_stray_row_is_only_dropped_because_of_its_date():
+    """Guard against the test passing for the wrong reason.
+
+    Aggregated as 1970-01-02 — the day it actually belongs to — the same stray
+    row is kept. That proves the exclusion is the window doing its job and not
+    the row being malformed or silently unparseable.
+    """
+    with open(SYNTHETIC_STRAY_CSV, newline="", encoding="utf-8") as handle:
+        profile, _ranges = ingest.aggregate_archive(
+            handle, 25, 1800, datetime.date(1970, 1, 2))
+
+    assert profile == {99975.0: {0}}
+
+
+def test_the_session_window_is_half_open():
+    """[session 00:00:00.000000, next session 00:00:00.000000).
+
+    Four rows one microsecond apart around both edges: the last microsecond of
+    the previous day and the first of the next are out; the first and last
+    microseconds of the session itself are in.
+    """
+    day = 86_400 * 1_000_000
+    rows = [
+        _csv_line(1, "100.0", "1", day - 1),          # 1969-12-31 23:59:59.999999
+        _csv_line(2, "200.0", "1", day),              # 1970-01-01 00:00:00.000000
+        _csv_line(3, "300.0", "1", 2 * day - 1),      # 1970-01-01 23:59:59.999999
+        _csv_line(4, "400.0", "1", 2 * day),          # 1970-01-02 00:00:00.000000
+    ]
+
+    profile, period_ranges = ingest.aggregate_archive(
+        iter(rows), 100, 1800, datetime.date(1970, 1, 2))
+
+    # Only rows 2 and 3 survive, and they land in the first and last period.
+    assert profile == {200.0: {0}, 300.0: {47}}
+    assert set(period_ranges) == {0, 47}
+
+
+def test_periods_are_measured_from_the_session_start_not_from_the_epoch():
+    """The period index is an offset into the session, for any session date."""
+    day = 86_400 * 1_000_000
+    rows = [_csv_line(1, "63000.0", "1", 20_000 * day + 1799 * 1_000_000),
+            _csv_line(2, "63000.0", "1", 20_000 * day + 1800 * 1_000_000)]
+
+    _profile, period_ranges = ingest.aggregate_archive(
+        iter(rows), 25, 1800, SYNTHETIC_SESSION + datetime.timedelta(days=20_000))
+
+    assert set(period_ranges) == {0, 1}
 
 
 # --- detect_trend, refactored off SQL ----------------------------------------
@@ -360,7 +450,7 @@ def test_aggregation_stays_under_the_memory_ceiling_on_a_five_million_row_day():
     tracemalloc.start()
     try:
         profile, period_ranges = ingest.aggregate_archive(
-            _synthetic_rows(5_000_000), 25, 1800)
+            _synthetic_rows(5_000_000), 25, 1800, SYNTHETIC_SESSION)
         _current, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -373,8 +463,10 @@ def test_aggregation_stays_under_the_memory_ceiling_on_a_five_million_row_day():
 
 def test_accumulator_does_not_grow_with_row_count():
     """The property behind the ceiling: state is bounded by buckets x periods."""
-    small = ingest.aggregate_archive(_synthetic_rows(20_000), 25, 1800)
-    large = ingest.aggregate_archive(_synthetic_rows(200_000), 25, 1800)
+    small = ingest.aggregate_archive(
+        _synthetic_rows(20_000), 25, 1800, SYNTHETIC_SESSION)
+    large = ingest.aggregate_archive(
+        _synthetic_rows(200_000), 25, 1800, SYNTHETIC_SESSION)
 
     assert len(small[0]) == len(large[0]) == 400
     assert len(small[1]) == len(large[1]) == 48
@@ -382,12 +474,30 @@ def test_accumulator_does_not_grow_with_row_count():
 
 # --- parity with the v1 Postgres path ----------------------------------------
 
+@pytest.fixture
+def captured_upsert(monkeypatch):
+    """compute_day's write, captured in a list instead of committed.
+
+    `db.upsert_daily_levels` commits, and `CONNECTION_STRING` in practice points
+    at the live database — so letting these tests run it would write real
+    `daily_levels` rows as a side effect of asserting parity. What parity needs
+    is the row compute_day produced, which is exactly what the capture holds.
+
+    `db.get_instrument` is deliberately left alone: reading the seeded
+    instrument config from the real database is part of what these tests cover,
+    and a read commits nothing.
+    """
+    rows = []
+    monkeypatch.setattr(ingest.db, "upsert_daily_levels", rows.append)
+    return rows
+
+
 @pytest.mark.parametrize("date_str", GOLDEN_DAYS)
 @pytest.mark.network
 @pytest.mark.skipif(IN_CI, reason="downloads from data.binance.vision; runs locally")
 @pytest.mark.skipif("CONNECTION_STRING" not in os.environ,
                     reason="compute_day reads instrument config from the database")
-def test_compute_day_reproduces_the_v1_golden_day(date_str):
+def test_compute_day_reproduces_the_v1_golden_day(date_str, captured_upsert):
     """V2_SPEC PR 3 acceptance: the in-memory path reproduces the SQL path.
 
     Exact equality on day_type and reason is full parity for detect_trend (the
@@ -412,9 +522,11 @@ def test_compute_day_reproduces_the_v1_golden_day(date_str):
     assert buckets_from_ranges(row["single_prints"], bucket_size) == \
         sorted(golden["arr_single_tpo"])
 
-    # And the row was persisted, with the current engine version.
-    stored = db.get_daily_levels("BTCUSDT", session_date)
-    assert stored is not None
+    # And that row — exactly one, not a partial write and not a retry — is what
+    # compute_day handed to storage, carrying the current engine version.
+    assert len(captured_upsert) == 1
+    stored = captured_upsert[0]
+    assert stored is row
     assert stored["engine_version"] == ingest.ENGINE_VERSION
     assert stored["day_type"] == golden["day_type"]
     assert stored["poc"] == golden["poc"]
@@ -424,13 +536,15 @@ def test_compute_day_reproduces_the_v1_golden_day(date_str):
 @pytest.mark.skipif(IN_CI, reason="downloads from data.binance.vision; runs locally")
 @pytest.mark.skipif("CONNECTION_STRING" not in os.environ,
                     reason="compute_day reads instrument config from the database")
-def test_profile_histogram_is_persisted_as_bucket_to_tpo_count():
+def test_profile_histogram_is_persisted_as_bucket_to_tpo_count(captured_upsert):
     """The JSONB `profile` composites will merge (V2_SPEC 2.2)."""
     session_date = datetime.date(2026, 7, 27)
     golden = load_golden("2026-07-27")
 
     row = ingest.compute_day("BTCUSDT", session_date)
 
+    # The histogram under test is the one handed to storage, not a copy.
+    assert captured_upsert == [row]
     profile = row["profile"]
     assert all(isinstance(key, str) for key in profile)
     assert all(isinstance(value, int) and value >= 1 for value in profile.values())
