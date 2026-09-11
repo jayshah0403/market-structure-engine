@@ -335,6 +335,29 @@ def test_range_rejects_an_inverted_window(client, store):
     assert response.status_code == 422
 
 
+def test_range_accepts_a_window_at_the_cap(client, store):
+    """V2_SPEC PR 4: the widest window the range endpoint will serve."""
+    start = datetime.date(2025, 1, 1)
+    end = start + datetime.timedelta(days=api.MAX_RANGE_DAYS - 1)
+
+    response = client.get("/v1/sessions/BTCUSDT?from=%s&to=%s" % (start, end))
+
+    assert response.status_code == 200
+    assert len(response.json()["missing"]) == api.MAX_RANGE_DAYS
+
+
+def test_range_rejects_a_window_past_the_cap(client, store):
+    """One day wider than the cap. Nothing is computed either way, but an
+    unbounded window builds an unbounded `missing` list in memory."""
+    start = datetime.date(2025, 1, 1)
+    end = start + datetime.timedelta(days=api.MAX_RANGE_DAYS)
+
+    response = client.get("/v1/sessions/BTCUSDT?from=%s&to=%s" % (start, end))
+
+    assert response.status_code == 422
+    assert store.compute_calls == []
+
+
 def test_range_rejects_an_unknown_symbol(client, store):
     response = client.get("/v1/sessions/NOPE?from=2026-07-07&to=2026-07-09")
 

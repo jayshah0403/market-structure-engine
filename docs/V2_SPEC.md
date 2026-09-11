@@ -170,7 +170,7 @@ def aggregate_archive(csv_stream, bucket_size, period_seconds, session_date) -> 
 |---|---|
 | `GET /v1/health` | `{status, db: ok/fail, engine_version}` |
 | `GET /v1/instruments` | seeded instruments |
-| `GET /v1/sessions/{symbol}/{date}` | cache hit → row; miss → `compute_day` synchronously → row. **[DECIDE]** sync (default, request timeout 90 s) vs async `202 + job id`. |
+| `GET /v1/sessions/{symbol}/{date}` | cache hit → row; miss → `compute_day` synchronously → row. **[DECIDED: sync]** — the cold path runs inline (~20 s). Bounded by the engine's archive timeouts (60 s per read, 300 s total), not by a request timeout at this layer; see Rules. |
 | `GET /v1/sessions/{symbol}?from=&to=` | cached rows in range + `missing: [dates]`. Does **not** trigger compute. |
 | `GET /v1/sessions/{symbol}/{date}/report` | text report (v1 `generate_report`) |
 
@@ -178,6 +178,12 @@ All responses are Pydantic models (`DailyLevels`, `SessionList`, …) so `/docs`
 
 **Rules.**
 - `date` is `YYYY-MM-DD`; anything else → 422. Unknown/inactive symbol → 404. Date ≥ today (UTC) → 404 `session not yet published`. Archive download failure → 503.
+- **Cold-path bound (D3, as built).** There is no request timeout at the API layer. A cold compute is bounded by two engine constants, both on the archive fetch, and either raises `ArchiveUnavailable` → 503:
+  - `ARCHIVE_TIMEOUT_SECONDS` = **60 s** — passed to `requests` as the connect and read timeout. It fires when the server sends *nothing* for 60 s, which is the stall case.
+  - `ARCHIVE_DEADLINE_SECONDS` = **300 s** — total wall clock for the whole fetch, measured from before the request so it covers connecting, waiting for headers and the transfer. `requests` applies its timeout per read, so a server trickling one chunk just inside the 60 s window never trips it; without a total deadline such a connection holds one of the three compute slots indefinitely. **Why 300:** a real day's archive is 5–20 MB and completes in about 20 s, so 300 s is roughly fifteen times the observed cost — generous for a genuinely slow link while still bounding the slow-drip case. It is a ceiling on pathological transfers, not a performance target.
+
+  The earlier "request timeout 90 s" was never enforced anywhere and has been dropped rather than left as an aspiration.
+- **Range window.** `from` and `to` are both required and inclusive, and may span at most **365 days**; wider → 422. The endpoint never computes, so this bounds response size and the `missing` list, not work.
 - Cache hit requires `engine_version == ENGINE_VERSION`; stale rows recompute and overwrite.
 - Rate limit **[DECIDE]** — default 30 req/min per IP (`slowapi`); cold computes additionally limited to **[DECIDE]** default 3 concurrent.
 - Old `/profile` and `/report` routes removed. README updated.
@@ -321,7 +327,7 @@ C1 is excluded (ends before `from`); C2 is returned whole although it starts bef
 |---|---|---|
 | D1 | second instrument at launch | no |
 | D2 | compute memory ceiling | 256 MB |
-| D3 | cold path sync vs async | sync, 90 s |
+| D3 | cold path sync vs async | **sync** — bounded by the archive fetch: 60 s per read, 300 s total; no request timeout at the API layer |
 | D4 | rate limit | 30/min/IP; 3 concurrent cold computes |
 | D5 | traded-through definition | touched (within later day's range) |
 | D6 | max lookback | 90 |

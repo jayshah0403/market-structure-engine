@@ -21,6 +21,7 @@ import io
 import math
 import string
 import tempfile
+import time
 import zipfile
 from datetime import date as _date
 
@@ -32,10 +33,23 @@ import db
 # (V2_SPEC section 4, "Versioning").
 ENGINE_VERSION = 1
 
-# HTTP read timeout for the archive download, in seconds. Not instrument config:
-# it is a transport tuning knob, and it sits under the 90 s budget the cold API
-# path gets in V2_SPEC D3.
+# Connect and read timeout for the archive download, in seconds. Not instrument
+# config: it is a transport tuning knob. This is the bound that actually limits
+# how long a cold compute can run — `requests` waits forever without it, and a
+# server that accepts the connection and then stops sending would hold an API
+# compute slot open indefinitely (V2_SPEC PR 4, "Rules"). It caps the wait for
+# headers and the gap between chunks, not total transfer time.
 ARCHIVE_TIMEOUT_SECONDS = 60
+
+# Total wall-clock bound on one archive fetch, in seconds. The timeout above is
+# applied by `requests` to each individual read, so a server trickling one chunk
+# just inside that window never trips it and holds an API compute slot open for
+# as long as it likes. This is the bound on the whole transfer, and it is what
+# makes "a cold compute cannot run indefinitely" true rather than nearly true.
+# 300 s is deliberately generous: a real day's archive is 5-20 MB and completes
+# in about 20 s, so this only fires on a link that is pathological rather than
+# merely slow (V2_SPEC PR 4, "Rules").
+ARCHIVE_DEADLINE_SECONDS = 300
 
 # Streamed to disk in chunks this size, so neither the zip nor the CSV is ever
 # held in memory whole.
@@ -89,6 +103,10 @@ def open_archive_csv(url):
     CSV, neither of which may sit in the 256 MB budget (V2_SPEC D2). The temp
     file is deleted when the context closes.
     """
+    # Started before the request, so the deadline covers connecting and waiting
+    # for headers as well as the transfer itself.
+    deadline = time.monotonic() + ARCHIVE_DEADLINE_SECONDS
+
     try:
         response = requests.get(url, stream=True, timeout=ARCHIVE_TIMEOUT_SECONDS)
     except requests.RequestException as exc:
@@ -104,6 +122,10 @@ def open_archive_csv(url):
         with tempfile.TemporaryFile() as spool:
             try:
                 for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_BYTES):
+                    if time.monotonic() > deadline:
+                        raise ArchiveUnavailable(
+                            "%s exceeded the %d s download deadline"
+                            % (url, ARCHIVE_DEADLINE_SECONDS))
                     spool.write(chunk)
             except requests.RequestException as exc:
                 raise ArchiveUnavailable("%s: %s" % (url, exc)) from exc
