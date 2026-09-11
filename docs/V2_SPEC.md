@@ -138,6 +138,7 @@ def compute_day(symbol: str, session_date: date) -> DailyLevels:   # pure comput
 def aggregate_archive(csv_stream, bucket_size, period_seconds) -> tuple[dict[float, set[int]], dict[int, tuple[float, float]]]
     # returns profile {bucket: set(periods)} and period_ranges {period: (high, low)}
 ```
+*As built (PR 3):* `DailyLevels` is a plain `dict` keyed on `daily_levels` columns, not a class — a Pydantic model in the engine would put a web dependency below the API layer, and PR 4 is where the response models live. Two helpers came with it: `open_archive_csv(url)`, a context manager yielding the zip's CSV as a text stream, and `single_print_ranges(buckets, bucket_size)`. `compute_structures` is no longer `compute_structures(start_ts)`: it takes `(profile, period_ranges, symbol, session_date, bucket_size, ib_periods)` and returns the row.
 
 **Rules.**
 - Download `archive_url_template` for the symbol/date. On HTTP 404 → raise `SessionNotPublished` (archive appears ~02:00 UTC next day).
@@ -145,13 +146,14 @@ def aggregate_archive(csv_stream, bucket_size, period_seconds) -> tuple[dict[flo
 - Column positions (headerless): `[0]=agg_trade_id, [1]=price, [2]=qty, [5]=timestamp_micro, [6]=is_buyer_maker`. Timestamp is **microseconds**.
 - `bucket = floor(price / bucket_size) * bucket_size`; `period = floor(seconds_since_utc_midnight / period_seconds)`.
 - Existing detectors (`compute_poc`, `compute_value_area`, `compute_ib`, `segment_profile`, `detect_double_distribution_split`, `classify_day_type`) are called **unchanged** on the in-memory profile. `detect_trend` is refactored to take `period_ranges` instead of running SQL.
+  - *Correction (PR 3):* `compute_ib` could not stay literally unchanged — it hardcoded "period 0 or 1", which contradicts §4's rule that `ib_periods` comes from `instruments`. It gained one parameter, `compute_ib(profile, ib_periods=2)`; the body's logic is untouched and the default reproduces v1 exactly. Every other detector is called with its v1 signature.
 - `single_prints` are emitted as contiguous ranges.
 - Result is upserted into `daily_levels` with the current `ENGINE_VERSION`.
-- Memory ceiling **[DECIDE]** — default: process must stay < 256 MB on a 5M-row day (assert in an integration test with a fixture-sized file).
+- Memory ceiling **[DECIDED: 256 MB]** — measured, not just asserted: 5M rows through `aggregate_archive` peak at 0.9 MB of Python allocation and 43.1 MB process RSS; end to end through `compute_day` on 2026-07-30 (1.44M rows, 21.6 MB zip) peak RSS is **53.9 MB**. The accumulator is bounded by buckets × periods, so it does not scale with row count — a committed test asserts that too. The download is streamed to a `tempfile.TemporaryFile` rather than a `BytesIO`, which is what keeps a ~75 MB zip off the heap.
 
 **Acceptance.**
 - Golden test: a committed fixture CSV (a small synthetic day) → known POC/VAH/VAL/IB.
-- Regression test: `compute_day("BTCUSDT", 2026-07-27)` reproduces the v1 Postgres-path values recorded in CURRENT_STATE (POC/VA/IB within one bucket).
+- Regression test: `compute_day("BTCUSDT", 2026-07-27)` reproduces the v1 Postgres-path values recorded in CURRENT_STATE (POC/VA/IB within one bucket). *Met more strictly (PR 3): all 8 golden days, exact equality on every bucket-valued field, not within one bucket.*
 - Unit test: `detect_trend(period_ranges)` gives identical output to the old SQL version on a fixture. **Parity is exact equality on `day_type` *and* the `reason` string** against `tests/fixtures/v1_golden/<date>.json` (owner decision at PR 2): `up_conf`/`down_conf` reach the output only through the Trend and Directional branches of `classify_day_type`, which embed the value in `reason`, and the Neutral / Non-Trend / Double-Distribution branches short-circuit before either value is read — so matching `day_type` + `reason` is full parity, and the confidences need no separate capture.
 - Unit test: unpublished date → `SessionNotPublished`, no partial row written.
 
@@ -302,7 +304,7 @@ C1 is excluded (ends before `from`); C2 is returned whole although it starts bef
 ## 4. Cross-cutting
 
 - **Versioning:** `ENGINE_VERSION` constant; bump on any detector change; stale cache recomputes lazily.
-- **Errors:** custom exceptions in the engine (`SessionNotPublished`, `NoTradeData`, `ArchiveUnavailable`); translated to HTTP only in the API layer. The engine never imports FastAPI.
+- **Errors:** custom exceptions in the engine (`SessionNotPublished`, `NoTradeData`, `ArchiveUnavailable`); translated to HTTP only in the API layer. The engine never imports FastAPI. *As built (PR 3):* all three exist under a shared `EngineError` base, plus `UnknownInstrument` for a symbol with no `instruments` row — PR 4 needs to tell that 404 apart from a not-yet-published one. `NoTradeData` also subclasses `ValueError`, so callers written against v1's empty-profile `ValueError` still work.
 - **Config:** all per-instrument parameters come from `instruments`; no hardcoded symbol, bucket, period, or URL anywhere in engine code.
 - **Tests:** pure engine tests need no network or DB; archive downloads are mocked with committed fixtures. CI runs on every PR.
 - **Docs:** README rewritten for v2 routes; `CURRENT_STATE.md` updated at the end of each PR.
