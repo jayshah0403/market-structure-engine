@@ -28,7 +28,7 @@ load_dotenv()
 _conn = None
 _cur = None
 
-# Column order of `daily_levels` in db/schema.sql. Doubles as the whitelist that
+# Column order of `daily_levels` in sql/schema.sql. Doubles as the whitelist that
 # upsert_daily_levels validates row keys against, so a caller's dict keys are
 # never interpolated into SQL unchecked.
 DAILY_LEVELS_COLUMNS = (

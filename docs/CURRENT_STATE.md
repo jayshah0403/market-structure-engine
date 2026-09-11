@@ -10,20 +10,21 @@ Baseline document. Everything the system does today, how it does it, and the deb
 |---|---|---|
 | `ingest.py` | Profile computation, all detectors, classifier, report generator. No DB connection code and no ingestion since PR 2 | ~240 lines; `get_profile_grid` and `detect_trend` still query the dropped `trades` table — replaced in PR 3 |
 | `db.py` | The only module holding SQL against the v2 tables: lazy `get_connection`/`get_cursor`, `get_instrument`, `get_daily_levels`, `upsert_daily_levels`, `list_daily_levels` | Added in PR 2; storage only, computes nothing |
-| `db/schema.sql` | v2 DDL (§2) + BTCUSDT seed; drops the v1 tick tables at the top | Added in PR 2 and applied |
+| `sql/schema.sql` | v2 DDL (§2) + BTCUSDT seed. Constructive only and idempotent (`CREATE TABLE IF NOT EXISTS`, seed `ON CONFLICT DO NOTHING`), so re-applying it cannot lose a computed row | Added in PR 2 and applied |
+| `sql/001_drop_v1.sql` | The v1 teardown: `DROP TABLE IF EXISTS trades, staging_trades, instruments`. Kept apart from `schema.sql` so destructive and constructive statements never share a script | **Already applied (2026-09-10) — not to be re-run.** Nothing left to drop |
 | `scripts/capture_v1_golden.py` | One-shot: ran the v1 SQL path over every ingested day into `tests/fixtures/v1_golden/*.json` before the drop | Ran once; cannot be re-run (its table is gone). PR 3's regression baseline |
 | `api.py` | FastAPI wrapper — 2 endpoints + auto `/docs` | Untouched by PR 2; serves nothing — both routes call `compute_structures`, whose SQL targets the dropped `trades`. Replaced in PR 4 |
 | `tests/test_engine.py`, `tests/test_db.py` | 5 pure engine tests + 2 pure validation tests + 7 DB integration tests. There is no `conftest.py` (this row previously claimed one) | 14 pass with a database; 7 pass / 7 skip without one |
 | `Dockerfile`, `.dockerignore`, `requirements.txt` | `python:3.13-slim`, deps: fastapi, uvicorn, psycopg2-binary, requests, python-dotenv; `.env` excluded from image | Working |
 | Railway | Hosts the container; `CONNECTION_STRING` injected as env var | **Paid plan active (Sept 2026); service was offline after trial expiry — needs redeploy** |
-| Supabase (Postgres 17.6, free tier, t4g.nano, ap-southeast-2) | The only data store | **LIVE** — the same project, reachable again (owner decision at PR 2: reuse, do not recreate). `db/schema.sql` dropped the tick tables and created the v2 schema: 855 MB → 10 MB, so the disk pressure that killed it is gone. `CONNECTION_STRING` is unchanged. |
+| Supabase (Postgres 17.6, free tier, t4g.nano, ap-southeast-2) | The only data store | **LIVE** — the same project, reachable again (owner decision at PR 2: reuse, do not recreate). `sql/001_drop_v1.sql` dropped the tick tables and `sql/schema.sql` created the v2 schema: 855 MB → 10 MB, so the disk pressure that killed it is gone. `CONNECTION_STRING` is unchanged. |
 | `README.md` | Pitch + endpoints + setup | Links the Railway URL |
 
 ---
 
 ## 2. Data layer (v2 schema, live since PR 2)
 
-DDL lives in `db/schema.sql` (committed, applied). All access goes through `db.py`.
+DDL lives in `sql/` (committed, applied). Two files, deliberately: **`sql/001_drop_v1.sql`** is the one-time v1 teardown (already applied, never to be re-run), and **`sql/schema.sql`** is constructive only and idempotent — `CREATE TABLE IF NOT EXISTS` throughout and a seed that does nothing on conflict, so re-applying it over a live database creates what is missing and cannot destroy a computed row. It is not a migration tool: changing the shape of an existing table needs its own numbered script. All runtime access goes through `db.py`.
 
 **`instruments`** — `symbol TEXT PK`, `exchange`, `bucket_size NUMERIC`, `period_seconds INT`, `ib_periods INT`, `archive_url_template TEXT`, `active BOOL`. The v1 surrogate `id` and `tick_size`/`session_start_utc` columns are gone; `symbol` is the key everything else references. Seeded with one row: BTCUSDT / `binance-spot` / 25 / 1800 / 2 / the data.binance.vision daily aggTrades template. These columns exist so the engine can read them — PR 3 is where it starts to (the two surviving SQL queries in `ingest.py` still hardcode 25 and 1800).
 
@@ -126,7 +127,7 @@ Run: `python -m pytest -v`. **14 passed** locally with a database; **7 passed / 
 - Millisecond-epoch path parameter instead of dates; no instrument in the route; no listing/range/cross-day; no typed schemas; no caching; recomputes on every hit.
 
 **Ops**
-- ~~Supabase project must be recreated~~ — **closed in PR 2**, but by reuse rather than recreation (owner decision): the project came back, `db/schema.sql` replaced its contents, and `CONNECTION_STRING` therefore never changed, so Railway needs no new secret — only the redeploy it already needed. README still describes the v1 ingestion path and the `/profile/{ms}` routes; V2_SPEC assigns that rewrite to PR 4.
+- ~~Supabase project must be recreated~~ — **closed in PR 2**, but by reuse rather than recreation (owner decision): the project came back, `sql/001_drop_v1.sql` + `sql/schema.sql` replaced its contents, and `CONNECTION_STRING` therefore never changed, so Railway needs no new secret — only the redeploy it already needed. README still describes the v1 ingestion path and the `/profile/{ms}` routes; V2_SPEC assigns that rewrite to PR 4.
 - No scheduled ingestion — data only exists for days manually loaded.
 - No linting, no dependency pinning. (CI added in PR 1: GitHub Actions runs `python -m pytest` on push and pull request.)
 

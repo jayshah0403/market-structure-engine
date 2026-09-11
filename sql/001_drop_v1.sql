@@ -1,0 +1,29 @@
+-- 001 — drop the v1 tick storage.  ***ALREADY APPLIED — DO NOT RUN AGAIN.***
+--
+-- Applied once, 2026-09-10, to the reused Supabase project, immediately after
+-- scripts/capture_v1_golden.py had preserved the v1 output for all 8 ingested
+-- days in tests/fixtures/v1_golden/. Effect: 7,377,603 tick rows removed and the
+-- database went 855 MB -> 10 MB, which is what relieved the free-tier disk
+-- pressure that took the project down (CURRENT_STATE section 2).
+--
+-- This file is a record, not a step to repeat. It is kept separate from
+-- sql/schema.sql because destructive and constructive statements must never sit
+-- in the same script: schema.sql is idempotent and safe to re-run, and nothing
+-- that drops a table should be reachable by re-running it. There is nothing left
+-- for this script to drop; running it against a v2 database is a no-op for
+-- trades/staging_trades and would be REFUSED for instruments, which
+-- daily_levels and composites now reference.
+--
+-- Why the v1 tables went, rather than being migrated: v2 never persists raw
+-- ticks (V2_SPEC section 0, "Guiding principle"). The engine only ever read
+-- aggregates out of them, and PR 3 computes those aggregates in one streaming
+-- pass over the daily archive instead.
+--
+-- Recovery, should a v1 tick table ever be needed again: re-ingest from
+-- data.binance.vision. Nothing here is recoverable from this database.
+--
+--   psql "$CONNECTION_STRING" -f sql/001_drop_v1.sql
+
+-- trades holds the FK onto instruments; naming all three in one statement lets
+-- Postgres resolve the drop order itself.
+DROP TABLE IF EXISTS trades, staging_trades, instruments;

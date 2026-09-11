@@ -111,16 +111,17 @@ Seed: BTCUSDT only. **[DECIDE]** any second instrument at launch (ETHUSDT?) — 
 
 ### PR 2 — New data layer
 
-**What.** ~~Fresh Supabase project.~~ **Reuse the existing Supabase project** (owner decision at PR 2: it is reachable again, so it was re-schemad in place rather than recreated; `db/schema.sql` drops the v1 tick tables at the top, which is what relieves the disk pressure). Create `instruments`, `daily_levels`, `composites` (DDL in `db/schema.sql`, committed). Seed BTCUSDT. Remove `trades`, `staging_trades`, `fetchDayRecords`, `load_day_from_archive`, and the COPY/staging code from the codebase (they live in git history).
+**What.** ~~Fresh Supabase project.~~ **Reuse the existing Supabase project** (owner decision at PR 2: it is reachable again, so it was re-schemad in place rather than recreated; `sql/001_drop_v1.sql` drops the v1 tick tables, which is what relieves the disk pressure). Create `instruments`, `daily_levels`, `composites` (DDL in `sql/schema.sql`, committed). Seed BTCUSDT. Remove `trades`, `staging_trades`, `fetchDayRecords`, `load_day_from_archive`, and the COPY/staging code from the codebase (they live in git history).
 
 **Interface.** `db.py` module: `get_connection()` (lazy, from `CONNECTION_STRING`), `get_daily_levels(symbol, date)`, `upsert_daily_levels(row)`, `list_daily_levels(symbol, from_date, to_date)` (`from` is a Python keyword — the signature reads `from_date`/`to_date`, inclusive), `get_instrument(symbol)`. `get_cursor()` moves here from `ingest.py`. Reads return plain dicts with NUMERIC as `float`, JSONB parsed, dates as `date`.
 
 **Rules.**
 - Schema exactly as §2. Upsert keyed on `(symbol, session_date)`.
 - Nothing in this PR downloads or computes; it is storage only.
+- **Destructive and constructive statements never share a script** (owner decision at PR 2). `sql/001_drop_v1.sql` holds the one-time v1 teardown and is marked already-applied; `sql/schema.sql` is constructive only and idempotent (`CREATE TABLE IF NOT EXISTS`, seed `ON CONFLICT DO NOTHING`) so it can be re-applied to a live database without risking a computed row. Idempotent ≠ migration: altering an existing table needs its own numbered script.
 
 **Acceptance.**
-- `schema.sql` applies cleanly to an empty database.
+- `schema.sql` applies cleanly to an empty database, and applying it a second time changes nothing (no error, seed not doubled, existing `daily_levels` rows intact). A static test asserts `schema.sql` contains no `DROP`/`TRUNCATE`/`DELETE`/`ALTER` and that `001_drop_v1.sql` contains no `CREATE`/`INSERT`.
 - Round-trip test: upsert a fixture row → read it back equal (including JSONB fields).
 - No reference to `staging_trades` or the COPY/staging path anywhere in the repo, and no code that writes ticks. **Two `FROM trades` queries remain, in `ingest.py`'s `get_profile_grid` and `detect_trend`:** PR 3 replaces both with the in-memory archive path, and deleting them in PR 2 would mean deleting `compute_structures`, `api.py`'s two routes and the PR 1 acceptance tests a PR early. They are documented as dead-until-PR-3 in the `ingest.py` docstring. `scripts/capture_v1_golden.py` also names `trades` by necessity — it is the one-shot that read the table before it was dropped.
 - Railway `CONNECTION_STRING` needs no change (same project reused, same credentials); the redeploy Railway already needed is still outstanding and `/health` (added in PR 4) will verify it.
@@ -151,7 +152,7 @@ def aggregate_archive(csv_stream, bucket_size, period_seconds) -> tuple[dict[flo
 **Acceptance.**
 - Golden test: a committed fixture CSV (a small synthetic day) → known POC/VAH/VAL/IB.
 - Regression test: `compute_day("BTCUSDT", 2026-07-27)` reproduces the v1 Postgres-path values recorded in CURRENT_STATE (POC/VA/IB within one bucket).
-- Unit test: `detect_trend(period_ranges)` gives identical output to the old SQL version on a fixture.
+- Unit test: `detect_trend(period_ranges)` gives identical output to the old SQL version on a fixture. **Parity is exact equality on `day_type` *and* the `reason` string** against `tests/fixtures/v1_golden/<date>.json` (owner decision at PR 2): `up_conf`/`down_conf` reach the output only through the Trend and Directional branches of `classify_day_type`, which embed the value in `reason`, and the Neutral / Non-Trend / Double-Distribution branches short-circuit before either value is read — so matching `day_type` + `reason` is full parity, and the confidences need no separate capture.
 - Unit test: unpublished date → `SessionNotPublished`, no partial row written.
 
 ---

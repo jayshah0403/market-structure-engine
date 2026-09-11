@@ -2,26 +2,29 @@
 --
 -- Persistent storage is three small tables: per-instrument config, one computed
 -- row per session, and the composites those sessions belong to. Raw ticks are
--- never persisted (V2_SPEC section 0, "Guiding principle") — which is why the
--- v1 tick tables are dropped first.
+-- never persisted (V2_SPEC section 0, "Guiding principle").
 --
--- Apply with:  psql "$CONNECTION_STRING" -f db/schema.sql
+-- Apply with:  psql "$CONNECTION_STRING" -f sql/schema.sql
 --
--- NOTE: this script is written for a first application against the v1 database.
--- Re-applying it over an already-migrated database fails (instruments cannot be
--- dropped while daily_levels/composites reference it, and the CREATEs are not
--- IF NOT EXISTS) — deliberately, so it cannot silently discard computed rows.
-
--- v1 tick storage. Retaining raw ticks forever is what filled the free tier
--- (CURRENT_STATE section 2). trades is listed before instruments because it
--- holds the FK; a single DROP handles the dependency order between them.
-DROP TABLE IF EXISTS trades, staging_trades, instruments;
+-- CONSTRUCTIVE ONLY, AND IDEMPOTENT. Every statement is CREATE TABLE IF NOT
+-- EXISTS or an INSERT that does nothing on conflict, so re-running this script
+-- against a live database creates what is missing and touches nothing that
+-- exists — no computed daily_levels or composites row can be lost to a re-run.
+-- Nothing here drops anything: the v1 teardown is sql/001_drop_v1.sql, already
+-- applied and kept apart precisely so that a re-run of this file cannot reach it.
+--
+-- What idempotent does NOT mean here: this is not a migration tool. IF NOT
+-- EXISTS skips a table that already exists whatever shape it is in, so it will
+-- not add a column to, or alter, an existing table. Changing the shape of a
+-- live table needs its own numbered script (002_..., ALTER TABLE), and
+-- tests/test_db.py::test_schema_columns_match_the_storage_layer is what catches
+-- a schema that has drifted from db.py.
 
 
 -- 2.1 instruments — every per-instrument parameter the engine reads at runtime.
 -- No bucket size, period, or URL is hardcoded in engine code (V2_SPEC section 4,
 -- "Config").
-CREATE TABLE instruments (
+CREATE TABLE IF NOT EXISTS instruments (
     symbol               TEXT PRIMARY KEY,
     exchange             TEXT    NOT NULL,
     bucket_size          NUMERIC NOT NULL,
@@ -34,7 +37,7 @@ CREATE TABLE instruments (
 
 -- 2.3 composites — one row per emitted composite. Created before daily_levels
 -- because daily_levels.composite_id references it.
-CREATE TABLE composites (
+CREATE TABLE IF NOT EXISTS composites (
     id             SERIAL PRIMARY KEY,
     symbol         TEXT    NOT NULL REFERENCES instruments (symbol),
     start_date     DATE    NOT NULL,
@@ -57,7 +60,7 @@ CREATE TABLE composites (
 
 -- 2.2 daily_levels — one row per (symbol, session_date). This row is the cached
 -- primitive everything else derives from; `profile` is required for composites.
-CREATE TABLE daily_levels (
+CREATE TABLE IF NOT EXISTS daily_levels (
     symbol           TEXT        NOT NULL REFERENCES instruments (symbol),
     session_date     DATE        NOT NULL,          -- UTC calendar day
     engine_version   INT         NOT NULL,          -- stale rows recompute lazily
@@ -91,9 +94,12 @@ CREATE TABLE daily_levels (
 
 
 -- Seed: BTCUSDT only (V2_SPEC section 2.1 / decision D1 — no second instrument
--- at launch).
+-- at launch). DO NOTHING rather than DO UPDATE: a re-run must not silently
+-- revert a bucket_size or active flag that was changed deliberately on the live
+-- instrument. Changing seeded config is an explicit UPDATE, not a re-apply.
 INSERT INTO instruments (symbol, exchange, bucket_size, period_seconds,
                          ib_periods, archive_url_template, active)
 VALUES ('BTCUSDT', 'binance-spot', 25, 1800, 2,
         'https://data.binance.vision/data/spot/daily/aggTrades/{symbol}/{symbol}-aggTrades-{date}.zip',
-        TRUE);
+        TRUE)
+ON CONFLICT (symbol) DO NOTHING;
