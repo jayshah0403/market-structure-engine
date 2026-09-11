@@ -84,6 +84,31 @@ def _row_to_dict(cursor, row):
     return {col.name: _scalar(value) for col, value in zip(cursor.description, row)}
 
 
+def ping():
+    """Round-trip the connection. Raises if the database cannot be reached.
+
+    Here rather than in the API layer because db.py is the only module that
+    holds SQL (V2_SPEC PR 2); `/v1/health` needs to know whether storage answers
+    without writing a query of its own.
+    """
+    cur = get_cursor()
+    cur.execute("SELECT 1")
+    return cur.fetchone()[0] == 1
+
+
+def list_instruments():
+    """Every instruments row as a dict, symbol ascending.
+
+    Inactive rows are included: whether `active` is a 404 is an HTTP decision
+    and belongs to the API layer (V2_SPEC PR 4), the same rule `get_instrument`
+    already follows.
+    """
+    cur = get_cursor()
+    cur.execute(
+        f"SELECT {', '.join(INSTRUMENT_COLUMNS)} FROM instruments ORDER BY symbol")
+    return [_row_to_dict(cur, row) for row in cur.fetchall()]
+
+
 def get_instrument(symbol):
     """The instruments row for `symbol` as a dict, or None if unknown.
 

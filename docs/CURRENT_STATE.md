@@ -9,17 +9,17 @@ Baseline document. Everything the system does today, how it does it, and the deb
 | File / thing | Role | Status |
 |---|---|---|
 | `ingest.py` | The engine: archive download, streaming aggregation, all detectors, classifier, report generator, and `compute_day` | ~400 lines. No SQL at all since PR 3 — `get_profile_grid` and `compute_profile` are deleted and `detect_trend` takes period ranges. Every parameter comes from `instruments` |
-| `db.py` | The only module holding SQL against the v2 tables: lazy `get_connection`/`get_cursor`, `get_instrument`, `get_daily_levels`, `upsert_daily_levels`, `list_daily_levels` | Added in PR 2; storage only, computes nothing |
+| `db.py` | The only module holding SQL against the v2 tables: lazy `get_connection`/`get_cursor`, `ping`, `get_instrument`, `list_instruments`, `get_daily_levels`, `upsert_daily_levels`, `list_daily_levels` | Added in PR 2; storage only, computes nothing. PR 4 added `ping` (for `/v1/health`) and `list_instruments` (for `/v1/instruments`) so no SQL leaked into the API layer |
 | `sql/schema.sql` | v2 DDL (§2) + BTCUSDT seed. Constructive only and idempotent (`CREATE TABLE IF NOT EXISTS`, seed `ON CONFLICT DO NOTHING`), so re-applying it cannot lose a computed row | Added in PR 2 and applied |
 | `sql/001_drop_v1.sql` | The v1 teardown: `DROP TABLE IF EXISTS trades, staging_trades, instruments`. Kept apart from `schema.sql` so destructive and constructive statements never share a script | **Already applied (2026-09-10) — not to be re-run.** Nothing left to drop |
 | `scripts/make_synthetic_day.py` | Generates `tests/fixtures/synthetic_day.csv` (312 rows) from a TPO profile written out in its docstring, so the no-network golden test's expected values are auditable rather than whatever the code happened to print | Added in PR 3; re-runnable, output committed |
 | `scripts/capture_v1_golden.py` | One-shot: ran the v1 SQL path over every ingested day into `tests/fixtures/v1_golden/*.json` before the drop | Ran once; cannot be re-run (its table is gone). PR 3's regression baseline |
-| `api.py` | FastAPI wrapper — 2 endpoints + auto `/docs` | **Broken, knowingly.** Both routes call `compute_structures(start_ts)`, a signature PR 3 replaced; nothing imports them and PR 4 rewrites the module. See §7 |
-| `tests/test_engine.py`, `tests/test_db.py`, `tests/test_compute.py`, `pytest.ini` | 5 pure detector tests, 12 storage tests (8 needing a database), 31 compute tests (21 pure, 9 needing network + a database, 1 slow). `pytest.ini` registers the `network` and `slow` markers. There is no `conftest.py` | 48 pass locally; 30 pass / 18 skip with neither network nor database, which is what CI runs |
+| `api.py` | The HTTP layer: 5 typed `/v1` routes, cache-then-compute, rate limiting and the cold-compute cap. The only module that imports FastAPI | Rewritten in PR 4. Pydantic response models live here; the engine still returns plain dicts |
+| `tests/test_engine.py`, `tests/test_db.py`, `tests/test_compute.py`, `tests/test_api.py`, `pytest.ini` | 5 pure detector tests, 12 storage tests (8 needing a database), 31 compute tests (21 pure, 9 needing network + a database, 1 slow), 29 pure endpoint tests. `pytest.ini` registers the `network` and `slow` markers. There is no `conftest.py` | 77 pass locally; 59 pass / 18 skip with neither network nor database, which is what CI runs |
 | `Dockerfile`, `.dockerignore`, `requirements.txt` | `python:3.13-slim`, deps: fastapi, uvicorn, psycopg2-binary, requests, python-dotenv; `.env` excluded from image | Working |
 | Railway | Hosts the container; `CONNECTION_STRING` injected as env var | **Paid plan active (Sept 2026); service was offline after trial expiry — needs redeploy** |
 | Supabase (Postgres 17.6, free tier, t4g.nano, ap-southeast-2) | The only data store | **LIVE** — the same project, reachable again (owner decision at PR 2: reuse, do not recreate). `sql/001_drop_v1.sql` dropped the tick tables and `sql/schema.sql` created the v2 schema: 855 MB → 10 MB, so the disk pressure that killed it is gone. `CONNECTION_STRING` is unchanged. |
-| `README.md` | Pitch + endpoints + setup | Links the Railway URL |
+| `README.md` | Pitch + `/v1` endpoints + setup, including the T+1 archive caveat and the ~20 s cold-miss latency | Rewritten in PR 4. Links the Railway URL |
 
 ---
 
@@ -79,20 +79,30 @@ Session = UTC 00:00–24:00. Bucket = $25. Period = 30 min (48 periods, lettered
 
 ---
 
-## 5. API surface (`api.py`)
+## 5. API surface (`api.py`) — PR 4
+
+The only module that imports FastAPI. Every route is typed, so `/docs` renders real schemas.
 
 | Endpoint | Input | Output | Errors |
 |---|---|---|---|
-| `GET /profile/{start_ts}` | `start_ts: int` — **UTC midnight in epoch milliseconds** (e.g. `1783382400000`) | `compute_structures` dict as JSON | `ValueError` → `404 {"detail": ...}` |
-| `GET /report/{start_ts}` | same | `{"report": "<text block>"}` | same |
-| `GET /docs` | — | auto OpenAPI UI | — |
+| `GET /v1/health` | — | `Health` — `{status, db, engine_version}` | `503` with `db: "fail"` when the database does not answer |
+| `GET /v1/instruments` | — | `list[Instrument]` — every seeded row, inactive included | — |
+| `GET /v1/sessions/{symbol}/{date}` | `date: YYYY-MM-DD` | `DailyLevels` | `422` malformed date · `404` unknown/inactive symbol, date ≥ today, archive not yet published, empty archive · `503` archive unreachable, or no compute slot |
+| `GET /v1/sessions/{symbol}?from=&to=` | two dates, both required | `SessionList` — `{symbol, from, to, sessions, missing}` | `422` malformed or inverted window · `404` unknown/inactive symbol |
+| `GET /v1/sessions/{symbol}/{date}/report` | `date: YYYY-MM-DD` | `SessionReport` — `{symbol, session_date, report}` | as the session route |
+| `GET /docs` | — | auto OpenAPI UI, fully typed | — |
 
-- No Pydantic response models → `/docs` shows untyped responses.
-- No instrument parameter — BTCUSDT everywhere.
-- No listing, no range, no "what days exist", no cross-day endpoint.
-- No caching: every request recomputes both SQL aggregations over millions of rows.
-- No auth, no rate limiting, no `/v1` versioning, no health endpoint, no request logging.
-- Non-midnight or non-UTC timestamps silently produce a partial/shifted window (no validation that `start_ts` is a day boundary).
+**Cache-then-compute.** A session request looks up the instrument (404 if unknown or inactive), rejects a date ≥ today as not yet published, then reads `daily_levels`. A row counts as a hit only when `engine_version == ENGINE_VERSION`; a stale row is recomputed and overwritten, which is what makes bumping that constant a lazy migration. On a miss the route calls `compute_day` **synchronously** (V2_SPEC D3) and then re-reads the stored row, because `computed_at` comes from the schema default and only the stored copy is the whole row.
+
+**Latency.** A hit is milliseconds. A miss is roughly 20 s — the archive download and aggregation — against a 90 s request budget. That budget is a deployment setting on the server in front of the app, not something the route enforces for itself.
+
+**The range endpoint never computes.** It reads the cache and reports every uncached day in `missing`. A day cached at a stale `engine_version` is reported as missing too, since it is not a hit and this route cannot refresh it; requesting that date individually recomputes it.
+
+**Limits (V2_SPEC D4).** 30 requests/minute/IP via `slowapi`, plus a `threading.BoundedSemaphore(3)` capping concurrent cold computes; a request that waits 30 s for a slot gets `503` with `Retry-After`. `/v1/health` is exempt from the rate limit so a platform health check cannot lock out real traffic. slowapi's counters are in-process, so they reset on redeploy and are per-replica — fine for one Railway container, and the thing to revisit before scaling out.
+
+**Errors.** The engine raises `SessionNotPublished`, `NoTradeData`, `UnknownInstrument` and `ArchiveUnavailable`; this layer is the only place they become status codes. Owner decision at PR 4: `SessionNotPublished` for a past date is a `404`, the same condition as asking for today, while `ArchiveUnavailable` is a `503`.
+
+**Not done here.** The Railway redeploy that would let `/v1/health` answer `db: ok` in production is still outstanding — it needs the owner's hand on the deploy, and V2_SPEC PR 4's last acceptance bullet stays open until then.
 
 ---
 
@@ -112,6 +122,14 @@ Session = UTC 00:00–24:00. Bucket = $25. Period = 30 min (48 periods, lettered
 - Session window: `tests/fixtures/synthetic_day_with_stray_row.csv` (the 312-row fixture plus one row at 00:00:00.000001 the following day, priced at 99999.99) aggregates to exactly the same profile and period ranges as the clean fixture; aggregated as the *next* session that row is kept, proving the exclusion is the window rather than a parse failure; and a four-row case asserts both edges of the half-open window. Pure, so they run in CI.
 - Memory: 5M rows through `aggregate_archive` under the 256 MB ceiling (`slow`, skipped in CI), plus a fast test that the accumulator does not grow with row count.
 
+**`tests/test_api.py`** — PR 4 acceptance. 29 tests, all pure: `db`'s five reads and `ingest.compute_day` are replaced by `FakeStore`, an in-memory stand-in, so the whole file runs in CI with no `CONNECTION_STRING` and no network.
+- Cache: a hit returns the stored row with `compute_day` never called; a miss calls it exactly once and returns what was persisted; a row at a stale `engine_version` is recomputed and overwritten.
+- Validation: malformed and impossible dates → 422; today and future → 404; unknown and inactive symbols → 404; inverted range window → 422.
+- Engine errors, translated: `ArchiveUnavailable` → 503, `SessionNotPublished` → 404, `NoTradeData` → 404, and a failed compute persists nothing.
+- Range: returns cached rows and names the missing dates, never computes, and counts a stale row as missing.
+- Typed schemas: the OpenAPI projection (route → status → schema name) is compared against the committed `tests/fixtures/openapi_v1.json`, and every 200 is asserted to reference a named model. A projection rather than the whole document, which churns with each FastAPI release.
+- Limits: the 31st request in a minute is a 429; `/v1/health` is exempt however often it is hit; and with the semaphore pinned to one slot, a second concurrent cold compute gets a 503 while the first is parked inside `compute_day`.
+
 **`tests/test_db.py`** — PR 2 acceptance. 8 tests need a live database, 4 do not.
 - Schema: `schema.sql` applies to an empty namespace (a throwaway schema created inside a transaction that is rolled back, with `search_path` pointed only at it so the DROPs cannot reach `public`); its columns, nullability and PK match the constants in `db.py`; the BTCUSDT seed row is exact; `composites.days >= 2` is enforced.
 - Round trip: a fixture row upserts and reads back equal, JSONB included; a second upsert on the same `(symbol, session_date)` updates rather than duplicating; `get_instrument` returns the seeded config and `None` for an unknown symbol. These use `session_date = 1970-01-01` (no archive can ever exist for it) and delete the row before and after. **These are the only tests left that write to the configured database** — deliberately, because what they cover *is* the upsert and the driver's JSONB round-trip, which a fake would not exercise. They are self-cleaning and the date cannot collide with a computed session, but they do commit against whatever `CONNECTION_STRING` points at.
@@ -119,7 +137,7 @@ Session = UTC 00:00–24:00. Bucket = $25. Period = 30 min (48 periods, lettered
 
 There is no `tests/conftest.py` — §1 used to claim one.
 
-Run: `python -m pytest -v`. **48 passed in 20m 50s** locally (the 8 parity days download ~110 MB of archives; the 5M-row memory test is pure compute). **30 passed / 18 skipped** with neither network nor database, which is what CI does — GitHub Actions provides no `CONNECTION_STRING` and sets `CI=true`, which is what the `network` and `slow` tests skip on. Locally, `-m "not network"` skips the downloads by hand and `-m network` runs only the parity days.
+Run: `python -m pytest -v`. **77 passed** locally (the 8 parity days download ~110 MB of archives; the 5M-row memory test is pure compute). **59 passed / 18 skipped** with neither network nor database, which is what CI does — GitHub Actions provides no `CONNECTION_STRING` and sets `CI=true`, which is what the `network` and `slow` tests skip on. Locally, `-m "not network"` skips the downloads by hand and `-m network` runs only the parity days.
 
 ---
 
@@ -137,11 +155,17 @@ Run: `python -m pytest -v`. **48 passed in 20m 50s** locally (the 8 parity days 
 - ~~`arr_single_tpo` is a flat list of bucket prices~~ — **closed in PR 3.** `single_prints` is now `[{"from": x, "to": y}]`, contiguous in whole buckets, so one zone is distinguishable from three. The parity test expands the ranges back to buckets to compare against v1.
 
 **API**
-- **`api.py` is broken as of PR 3** and left that way deliberately: both routes call `compute_structures(start_ts)`, whose signature changed to take an in-memory profile. Nothing imports `api.py` and PR 4 replaces both routes with the date-based, typed ones, so fixing it here would be work thrown away a PR later.
-- Millisecond-epoch path parameter instead of dates; no instrument in the route; no listing/range/cross-day; no typed schemas; no caching; recomputes on every hit.
+- ~~`api.py` is broken as of PR 3~~ — **closed in PR 4.** The module was rewritten: `/profile/{ms}` and `/report/{ms}` are gone, and the five `/v1` routes of §5 replace them with dates, typed schemas, caching and limits.
+- ~~Millisecond-epoch path parameter; no instrument in the route; no listing/range; no typed schemas; no caching~~ — **closed in PR 4.**
+- **No cap on the range window.** `GET /v1/sessions/{symbol}?from=&to=` accepts any span, so a decade-wide query builds a decade-long `missing` list in memory. It cannot trigger a compute, so the blast radius is one large response rather than hours of downloads. V2_SPEC D6 sets a max lookback of 90 for PR 5's endpoints but says nothing about this one; a cap belongs here whenever that is decided.
+- **Rate-limit counters are in-process.** `slowapi`'s default in-memory store resets on redeploy and is per-replica, so the 30/min limit is per-container rather than global. Fine for one Railway container; needs a shared backend before scaling out.
+- **The 90 s cold-path budget (V2_SPEC D3) is not enforced by the app.** The route caps how long a request waits for a compute *slot* (30 s) but not how long `compute_day` itself may run; the 90 s bound has to come from the server or proxy in front of it, and is not configured yet.
+
+**Testing**
+- **`tests/test_db.py` writes to the configured database.** The round-trip tests delete, upsert, commit and delete a `daily_levels` row against whatever `CONNECTION_STRING` points at — in practice the live Supabase project. It is deliberate and bounded: what they cover *is* `upsert_daily_levels` and psycopg2's JSONB round-trip, which a fake would not exercise, and they use `session_date = 1970-01-01`, a date no archive can ever exist for, deleting the row before and after. The debt is that a live credential plus an interrupted run can still leave a stray row in production storage, and that nothing stops the same tests being pointed at a real database by accident. Every other test in the repo is now pure — PR 3 removed the parity tests' writes and PR 4's endpoint tests never had any — so this is the last writer. Options when it is addressed: a dedicated test database in CI, or applying `schema.sql` to a throwaway schema and pointing the round trip at that.
 
 **Ops**
-- ~~Supabase project must be recreated~~ — **closed in PR 2**, but by reuse rather than recreation (owner decision): the project came back, `sql/001_drop_v1.sql` + `sql/schema.sql` replaced its contents, and `CONNECTION_STRING` therefore never changed, so Railway needs no new secret — only the redeploy it already needed. README still describes the v1 ingestion path and the `/profile/{ms}` routes; V2_SPEC assigns that rewrite to PR 4.
+- ~~Supabase project must be recreated~~ — **closed in PR 2**, but by reuse rather than recreation (owner decision): the project came back, `sql/001_drop_v1.sql` + `sql/schema.sql` replaced its contents, and `CONNECTION_STRING` therefore never changed, so Railway needs no new secret — only the redeploy it already needed. ~~README still describes the v1 ingestion path and the `/profile/{ms}` routes~~ — **closed in PR 4**, which rewrote it for the `/v1` routes, the T+1 archive caveat and the ~20 s cold-miss latency. The Railway **redeploy is still outstanding**, so the live URL still serves the old build.
 - No scheduled ingestion — data only exists for days computed on demand. The 8 golden days are cached in `daily_levels` as a side effect of the parity test; everything else is a cache miss until PR 7's warm-up.
 - No linting, no dependency pinning. (CI added in PR 1: GitHub Actions runs `python -m pytest` on push and pull request.)
 
