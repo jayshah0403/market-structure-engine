@@ -1,4 +1,4 @@
-# Market Structure Engine — Current State (Sept 2026; v1 inventory + PRs 1–2)
+# Market Structure Engine — Current State (Sept 2026; v1 inventory + PRs 1–4)
 
 Baseline document. Everything the system does today, how it does it, and the debts to spec against. No proposals in here — the v2 spec is a separate doc.
 
