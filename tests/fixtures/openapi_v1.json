@@ -1,0 +1,20 @@
+{
+  "GET /v1/health": {
+    "200": "#/components/schemas/Health"
+  },
+  "GET /v1/instruments": {
+    "200": "#/components/schemas/Instrument"
+  },
+  "GET /v1/sessions/{symbol}": {
+    "200": "#/components/schemas/SessionList",
+    "422": "#/components/schemas/HTTPValidationError"
+  },
+  "GET /v1/sessions/{symbol}/{session_date}": {
+    "200": "#/components/schemas/DailyLevels",
+    "422": "#/components/schemas/HTTPValidationError"
+  },
+  "GET /v1/sessions/{symbol}/{session_date}/report": {
+    "200": "#/components/schemas/SessionReport",
+    "422": "#/components/schemas/HTTPValidationError"
+  }
+}
