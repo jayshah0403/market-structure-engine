@@ -68,7 +68,7 @@ The pipeline, end to end:
 Two things worth knowing before you call it:
 
 - **Sessions publish T+1.** Binance publishes each day's archive at roughly **02:00 UTC the following day**, so the most recent session you can request is yesterday (UTC). Asking for today or any future date returns `404`, and so does a past date whose archive is not up yet.
-- **A cache miss is slow.** A cached session returns in milliseconds. A miss computes the session inline — downloading and aggregating the whole day's archive — which takes **roughly 20 seconds**, against a 90-second request budget. Once computed, a session stays cached.
+- **A cache miss is slow.** A cached session returns in milliseconds. A miss computes the session inline — downloading and aggregating the whole day's archive — which takes **roughly 20 seconds**. The download is bounded: 60 seconds without data, or 300 seconds in total, and you get a `503` rather than a request that hangs. Once computed, a session stays cached.
 
 Requests are limited to **30 per minute per IP**, and at most **3 cold computes** run concurrently; over that you get a `503` with a `Retry-After` header rather than a queue.
 
@@ -100,7 +100,7 @@ The service expects a `CONNECTION_STRING` environment variable pointing at a Pos
 
 `date` is `YYYY-MM-DD`; anything else is a `422`. An unknown or inactive symbol is a `404`. An archive that should exist but cannot be fetched is a `503`.
 
-To fill a window, ask the range endpoint what is `missing` and then request those dates individually — the range endpoint deliberately never computes, so a wide query can never turn into an accidental hour of downloads.
+The range endpoint's window is inclusive and may span at most **365 days**; wider is a `422`. To fill a window, ask it what is `missing` and then request those dates individually — it deliberately never computes, so a wide query can never turn into an accidental hour of downloads.
 
 ## Tests
 

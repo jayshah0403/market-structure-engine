@@ -13,9 +13,10 @@ Shape of every session request:
     cold compute       ->  under a concurrency cap, then read back what persisted
 
 The cold path is synchronous (V2_SPEC D3): a miss costs roughly 20 s while the
-day's archive is downloaded and aggregated. The 90 s request timeout that bounds
-it is a deployment setting on the server in front of this app, not something the
-route can enforce for itself.
+day's archive is downloaded and aggregated. What bounds it is the engine's own
+`ARCHIVE_TIMEOUT_SECONDS` (60 s) on the archive request, so a download that
+stalls fails instead of holding a compute slot open. There is no separate
+request timeout at this layer.
 """
 
 import datetime
@@ -43,9 +44,14 @@ RATE_LIMIT = f"{RATE_LIMIT_PER_MINUTE}/minute"
 # V2_SPEC D4: at most this many archive downloads run at once. The cap protects
 # memory (each compute peaks ~54 MB, CURRENT_STATE §3) rather than the database.
 MAX_CONCURRENT_COLD_COMPUTES = 3
-# How long a request waits for a slot before giving up. Well inside the 90 s
-# request budget, so the client gets a 503 it can retry rather than a timeout.
+# How long a request waits for a slot before giving up. The client gets a 503 it
+# can retry rather than a connection held open indefinitely.
 COLD_COMPUTE_WAIT_SECONDS = 30
+
+# Widest window the range endpoint will serve, in days inclusive. It never
+# computes, so this bounds response size and the `missing` list rather than
+# work: without it a decade-wide query builds a decade-long list of dates.
+MAX_RANGE_DAYS = 365
 
 cold_compute_slots = threading.BoundedSemaphore(MAX_CONCURRENT_COLD_COMPUTES)
 
@@ -260,17 +266,26 @@ def list_sessions(
 
     Days with no cached row, and days cached at a stale `engine_version`, are
     both reported in `missing`. Request one of those individually to compute it.
+
+    The window is inclusive on both ends and may span at most `MAX_RANGE_DAYS`
+    days; wider is a 422.
     """
     active_instrument(symbol)
     if from_date > to_date:
         raise HTTPException(
             status_code=422, detail="`from` must not be after `to`")
 
+    span = (to_date - from_date).days + 1
+    if span > MAX_RANGE_DAYS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"window spans {span} days; the maximum is {MAX_RANGE_DAYS}",
+        )
+
     fresh = {row["session_date"]: row
              for row in db.list_daily_levels(symbol, from_date, to_date)
              if _fresh(row)}
 
-    span = (to_date - from_date).days + 1
     wanted = [from_date + datetime.timedelta(days=offset) for offset in range(span)]
 
     return SessionList(
@@ -287,7 +302,8 @@ def list_sessions(
 def get_session(request: Request, symbol: str, session_date: datetime.date):
     """Cached rows return in milliseconds. A miss computes the session inline,
     which takes roughly **20 seconds** while the day's archive is downloaded and
-    aggregated; the request budget is 90 s (V2_SPEC D3).
+    aggregated (V2_SPEC D3). A download that stalls fails after 60 s rather than
+    holding the request open.
 
     A row cached at an older `engine_version` is recomputed and overwritten.
     """

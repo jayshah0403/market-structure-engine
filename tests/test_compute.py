@@ -21,7 +21,9 @@ import io
 import json
 import math
 import os
+import time
 import tracemalloc
+import zipfile
 
 import pytest
 
@@ -418,6 +420,137 @@ def test_unknown_symbol_is_rejected_before_any_download(monkeypatch):
 
     with pytest.raises(ingest.UnknownInstrument):
         ingest.compute_day("NOPE", datetime.date(2026, 7, 27))
+
+
+# --- the archive fetch is bounded ---------------------------------------------
+# Regression guards: these pin behaviour that already exists rather than
+# describing a change. Without them nothing stops the timeout being dropped,
+# which is what would let a stalled download hold a compute slot open.
+
+def test_the_archive_request_carries_the_read_timeout(monkeypatch, stub_instrument):
+    """`requests` would wait forever by default; the timeout is what stops that."""
+    seen = {}
+
+    def capture(url, **kwargs):
+        seen.update(kwargs)
+        return _Response(404)
+
+    monkeypatch.setattr(ingest.requests, "get", capture)
+
+    with pytest.raises(ingest.SessionNotPublished):
+        ingest.compute_day("BTCUSDT", datetime.date(2026, 9, 11))
+
+    assert seen["timeout"] == ingest.ARCHIVE_TIMEOUT_SECONDS
+    assert seen["stream"] is True
+
+
+def test_a_connect_timeout_becomes_archive_unavailable(monkeypatch, stub_instrument):
+    def time_out(url, **kwargs):
+        raise ingest.requests.exceptions.ConnectTimeout("no route")
+
+    monkeypatch.setattr(ingest.requests, "get", time_out)
+
+    with pytest.raises(ingest.ArchiveUnavailable):
+        ingest.compute_day("BTCUSDT", datetime.date(2026, 7, 27))
+
+
+def test_a_stalled_download_becomes_archive_unavailable(monkeypatch, stub_instrument):
+    """The server accepts the request, sends headers, then stops sending bytes.
+
+    `requests` raises ReadTimeout out of iter_content once the gap between
+    chunks passes the timeout; the engine must turn that into its own error
+    rather than letting a transport exception escape to the caller.
+    """
+    class _Stalling(_Response):
+        def __init__(self):
+            super().__init__(200)
+
+        def iter_content(self, chunk_size=1):
+            yield b"PK"
+            raise ingest.requests.exceptions.ReadTimeout("read timed out")
+
+    monkeypatch.setattr(ingest.requests, "get", lambda url, **kwargs: _Stalling())
+    written = []
+    monkeypatch.setattr(ingest.db, "upsert_daily_levels", written.append)
+
+    with pytest.raises(ingest.ArchiveUnavailable):
+        ingest.compute_day("BTCUSDT", datetime.date(2026, 7, 27))
+
+    assert written == []
+
+
+def test_a_slow_drip_download_is_abandoned_at_the_deadline(
+        monkeypatch, stub_instrument):
+    """A server that never stalls long enough to trip the read timeout.
+
+    `requests` applies its `timeout` to each individual read, so a server
+    trickling a chunk just inside that window keeps the connection alive
+    indefinitely and holds an API compute slot with it. The total-transfer
+    deadline is what bounds that. The constant is shrunk here so the test costs
+    milliseconds rather than 300 s; the chunks are really produced over real
+    time, so the code path under test is the production one.
+    """
+    monkeypatch.setattr(ingest, "ARCHIVE_DEADLINE_SECONDS", 0.05)
+
+    class _Dripping(_Response):
+        def __init__(self):
+            super().__init__(200)
+
+        def iter_content(self, chunk_size=1):
+            # Never raises: every individual read is prompt. Only the total
+            # elapsed time is out of bounds.
+            for _ in range(200):
+                time.sleep(0.005)
+                yield b"PK"
+
+    monkeypatch.setattr(ingest.requests, "get", lambda url, **kwargs: _Dripping())
+    written = []
+    monkeypatch.setattr(ingest.db, "upsert_daily_levels", written.append)
+
+    with pytest.raises(ingest.ArchiveUnavailable, match="deadline"):
+        ingest.compute_day("BTCUSDT", datetime.date(2026, 7, 27))
+
+    assert written == []
+
+
+def _zipped(csv_bytes, name="BTCUSDT-aggTrades-2026-07-27.csv"):
+    """The archive shape open_archive_csv expects: a zip holding one CSV."""
+    spool = io.BytesIO()
+    with zipfile.ZipFile(spool, "w") as archive:
+        archive.writestr(name, csv_bytes)
+    return spool.getvalue()
+
+
+def test_a_normal_download_completes_well_inside_the_deadline(
+        monkeypatch, stub_instrument):
+    """The deadline must not fire on a legitimate archive.
+
+    The counterpart to the test above, and the only case that drives
+    `open_archive_csv` end to end — download, zip, CSV — without the network.
+    The real deadline is left at its configured value.
+    """
+    with open(SYNTHETIC_CSV, "rb") as handle:
+        payload = _zipped(handle.read())
+
+    class _Serving(_Response):
+        def __init__(self):
+            super().__init__(200)
+
+        def iter_content(self, chunk_size=1):
+            for start in range(0, len(payload), 512):
+                yield payload[start:start + 512]
+
+    monkeypatch.setattr(ingest.requests, "get", lambda url, **kwargs: _Serving())
+    written = []
+    monkeypatch.setattr(ingest.db, "upsert_daily_levels", written.append)
+
+    row = ingest.compute_day("BTCUSDT", SYNTHETIC_SESSION)
+
+    # The same structures the no-network golden test derives by hand.
+    assert row["poc"] == 63100.0
+    assert row["vah"] == 63175.0
+    assert row["val"] == 63000.0
+    assert len(written) == 1
 
 
 # --- memory -------------------------------------------------------------------
